@@ -2,8 +2,9 @@
 
 A lightweight Linux container runtime written in C# / .NET 10 — a "Build Your
 Own Docker" learning project. It is developed in 8 phases; this repository is
-currently at **Phase 0 (environment setup / scaffold)**. No container
-functionality (`run`, `pull`, namespaces, cgroups, registry client) is
+currently at **Phase 1 (command parsing / `run`)**. `ccrun run <command>`
+executes a command directly and propagates its exit code, but no isolation
+(namespaces, chroot, cgroups) or image handling (`pull`, registry client) is
 implemented yet.
 
 ## Prerequisites
@@ -18,10 +19,14 @@ implemented yet.
 
 ```
 ccrun/
-  CCRun.sln
-  src/CCRun/            console app (net10.0)
-  tests/CCRun.Tests/    xUnit test project
-  alpine-rootfs/        downloaded Alpine root FS (git-ignored)
+  CCRun.slnx           .NET 10 XML solution file
+  src/CCRun/           console app (net10.0)
+    Program.cs         entrypoint, delegates to Cli
+    Cli.cs             verb dispatch + usage
+    ExitCodes.cs       named exit codes
+    Commands/          one class per command (RunCommand, …)
+  tests/CCRun.Tests/   xUnit test project
+  alpine-rootfs/       downloaded Alpine root FS (git-ignored)
 ```
 
 ## Build & test
@@ -29,7 +34,9 @@ ccrun/
 ```sh
 dotnet build          # compile the solution
 dotnet test           # run the xUnit tests
-dotnet run --project src/CCRun   # prints usage, exits non-zero (no commands yet)
+dotnet run --project src/CCRun               # no args → prints usage, exits 1
+dotnet run --project src/CCRun -- run echo hi # run a command, propagates its exit code
+dotnet run --project src/CCRun -- --help     # show usage
 ```
 
 ### Self-contained publish (later phases / NFR-1)
@@ -62,5 +69,6 @@ above has moved on.
 
 ## Roadmap
 
-Phases 1–8 (command parsing, P/Invoke, namespaces, chroot/pivot_root, cgroups,
-rootless mode, image pull, registry client) are forthcoming.
+- **Phase 1 — command parsing / `run`** ✅ done
+- Phases 2–8 (P/Invoke, chroot/pivot_root, namespaces, cgroups, rootless mode,
+  image pull, registry client) are forthcoming.
