@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CCRun/CCRun.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CCRun.Tests/CCRun.Tests.csproj" />
+  </Folder>
+</Solution>

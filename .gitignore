@@ -1,0 +1,13 @@
+# Downloaded Alpine root filesystem (large; regenerate via README instructions)
+alpine-rootfs/
+
+# .NET build artifacts
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+
+# IDE / user files
+*.user
+.vs/
+.idea/
