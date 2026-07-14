@@ -1,52 +1,34 @@
-using System.ComponentModel;
-using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace ccrun;
 
 /// <summary>
-/// Phase 1 `run`: launches the requested command as a child process, wiring
-/// its stdio to ccrun's own terminal and propagating its exit code. Isolation
-/// (namespaces, chroot, cgroups) arrives in later phases.
+/// Phase 2 `run` (parent/host stage): parses options, creates the container's
+/// UTS namespace via unshare(2), then re-executes ccrun in the hidden init
+/// stage (see <see cref="ReExec"/>) which sets the hostname and launches the
+/// user command. Requires CAP_SYS_ADMIN (root) until rootless mode (Phase 5).
 /// </summary>
 public static class RunCommand
 {
-    // args = [command, arg1, arg2, ...]
     public static int Execute(string[] args, TextWriter stdout, TextWriter stderr)
     {
-        if (args.Length == 0)
-        {
-            stderr.WriteLine("ccrun run: missing command");
-            stderr.WriteLine("usage: ccrun run <command> [args...]");
+        var options = RunOptions.Parse(args, stderr);
+        if (options is null)
             return ExitCodes.UsageError;
+
+        // New UTS namespace so the container holds its own hostname without
+        // touching the host's (FR-2.1, FR-2.3). Affects this process; the
+        // re-exec'd child inherits it.
+        if (Libc.Unshare(Libc.CLONE_NEWUTS) != 0)
+        {
+            int err = Marshal.GetLastPInvokeError();
+            stderr.WriteLine($"ccrun: unshare(CLONE_NEWUTS) failed: {Libc.LastErrorMessage()}");
+            if (err == Libc.EPERM)
+                stderr.WriteLine("hint: ccrun needs elevated privileges for namespaces; " +
+                                 "re-run under sudo (rootless mode arrives in Phase 5).");
+            return ExitCodes.RuntimeError;
         }
 
-        string command = args[0];
-
-        var psi = new ProcessStartInfo
-        {
-            FileName = command,
-            // No redirection + UseShellExecute=false => the child inherits
-            // ccrun's stdin/stdout/stderr for live, interactive IO (FR-1.3).
-            UseShellExecute = false,
-        };
-        
-        for (int i = 1; i < args.Length; i++)
-            psi.ArgumentList.Add(args[i]);
-
-        try
-        {
-            using var process = Process.Start(psi)
-                ?? throw new InvalidOperationException("Process.Start returned null");
-            process.WaitForExit();
-            return process.ExitCode; // FR-1.4
-        }
-        catch (Win32Exception ex)
-        {
-            // ENOENT (2) => not found; EACCES (13) => not executable.
-            stderr.WriteLine($"ccrun: cannot run '{command}': {ex.Message}");
-            return ex.NativeErrorCode == 13
-                ? ExitCodes.CommandNotExecutable
-                : ExitCodes.CommandNotFound;
-        }
+        return ReExec.RunChild(options, stderr);
     }
 }

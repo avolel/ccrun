@@ -10,4 +10,8 @@ public static class ExitCodes
     // familiar values.
     public const int CommandNotExecutable = 126;
     public const int CommandNotFound = 127;
+    
+    // Container setup failed before the user command ran (namespace / hostname
+    // setup, re-exec). Mirrors Docker's 125 "runtime error" convention.
+    public const int RuntimeError = 125;
 }

@@ -23,7 +23,8 @@ public static class Cli
         {
             case "run":
                 return RunCommand.Execute(args.AsSpan(1).ToArray(), stdout, stderr);
-
+            case ReExec.ChildVerb:
+                return ChildCommand.Execute(args.AsSpan(1).ToArray(), stdout, stderr);
             case "-h":
             case "--help":
             case "help":
@@ -42,9 +43,9 @@ public static class Cli
         w.WriteLine("ccrun: a lightweight Linux container runtime");
         w.WriteLine();
         w.WriteLine("usage:");
-        w.WriteLine("  ccrun run <command> [args...]   run a command in a container");
+        w.WriteLine("  ccrun run [--hostname <name>] <command> [args...]   run a command in a container");
         w.WriteLine("  ccrun --help                    show this help");
         w.WriteLine();
-        w.WriteLine("Phase 1: 'run' executes the command directly (no isolation yet).");
+        w.WriteLine("Phase 2: 'run' isolates the hostname in a new UTS namespace (needs sudo).");
     }
 }
