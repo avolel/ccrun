@@ -2,10 +2,11 @@
 
 A lightweight Linux container runtime written in C# / .NET 10 — a "Build Your
 Own Docker" learning project. It is developed in 8 phases; this repository is
-currently at **Phase 1 (command parsing / `run`)**. `ccrun run <command>`
-executes a command directly and propagates its exit code, but no isolation
-(namespaces, chroot, cgroups) or image handling (`pull`, registry client) is
-implemented yet.
+currently at **Phase 2 (hostname isolation)**. `ccrun run <command>` puts the
+command in a new UTS namespace so it gets its own hostname, runs it, and
+propagates its exit code. Creating that namespace needs root, so `run` requires
+sudo for now. There is still no filesystem or process isolation (chroot,
+PID/mount namespaces, cgroups) and no image handling (`pull`, registry client).
 
 ## Prerequisites
 
@@ -24,7 +25,10 @@ ccrun/
     Program.cs         entrypoint, delegates to Cli
     Cli.cs             verb dispatch + usage
     ExitCodes.cs       named exit codes
-    Commands/          one class per command (RunCommand, …)
+    RunOptions.cs      argument parsing for `run`
+    Commands/          RunCommand (parent stage) + ChildCommand (__child stage)
+    Native/            libc P/Invoke (unshare, sethostname, geteuid)
+    Container/         ReExec (re-launch as child) + ProcessRunner (spawn command)
   tests/CCRun.Tests/   xUnit test project
   alpine-rootfs/       downloaded Alpine root FS (git-ignored)
 ```
@@ -33,10 +37,21 @@ ccrun/
 
 ```sh
 dotnet build          # compile the solution
-dotnet test           # run the xUnit tests
+dotnet test           # run the xUnit tests (namespace tests need root; they skip otherwise)
 dotnet run --project src/CCRun               # no args → prints usage, exits 1
-dotnet run --project src/CCRun -- run echo hi # run a command, propagates its exit code
 dotnet run --project src/CCRun -- --help     # show usage
+```
+
+`ccrun run` creates a UTS namespace, which needs root. Build first, then run the
+produced binary under sudo — running `sudo dotnet run` would trigger a build as
+root and clutter the output:
+
+```sh
+dotnet build
+BIN=src/CCRun/bin/Debug/net10.0/CCRun
+sudo "$BIN" run /bin/sh -c hostname                 # prints: container
+sudo "$BIN" run --hostname web /bin/sh -c hostname  # prints: web
+"$BIN" run true                                     # no sudo → prints the sudo hint, exits 125
 ```
 
 ### Self-contained publish (later phases / NFR-1)
@@ -70,5 +85,6 @@ above has moved on.
 ## Roadmap
 
 - **Phase 1 — command parsing / `run`** ✅ done
-- Phases 2–8 (P/Invoke, chroot/pivot_root, namespaces, cgroups, rootless mode,
+- **Phase 2 — hostname isolation (UTS namespace) + re-exec architecture** ✅ done
+- Phases 3–8 (chroot/pivot_root, more namespaces, cgroups, rootless mode,
   image pull, registry client) are forthcoming.
