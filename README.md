@@ -2,11 +2,20 @@
 
 A lightweight Linux container runtime written in C# / .NET 10 — a "Build Your
 Own Docker" learning project. It is developed in 8 phases; this repository is
-currently at **Phase 2 (hostname isolation)**. `ccrun run <command>` puts the
-command in a new UTS namespace so it gets its own hostname, runs it, and
-propagates its exit code. Creating that namespace needs root, so `run` requires
-sudo for now. There is still no filesystem or process isolation (chroot,
-PID/mount namespaces, cgroups) and no image handling (`pull`, registry client).
+currently at **Phase 3 (chroot filesystem isolation)**. `ccrun run <command>`
+puts the command in a new UTS namespace so it gets its own hostname, runs it, and
+propagates its exit code. With `--rootfs <path>` it also `chroot`s into that root
+filesystem (then `chdir("/")`) so the command sees it as `/` and cannot escape
+above it. Creating the namespace needs `CAP_SYS_ADMIN` and `chroot` needs
+`CAP_SYS_CHROOT`, so `run` requires sudo for now. There is still no process
+isolation (PID namespace), no private mount table (mount namespace, `pivot_root`,
+private `/proc`), no resource limits (cgroups), and no image handling (`pull`,
+registry client).
+
+**New to the code?** [docs/code-overview/code-overview.md](docs/code-overview/code-overview.md) is a detailed,
+educational walkthrough of how the runtime works: the two-stage re-exec
+architecture, a full trace of a `run`, the chroot mechanics, why the chroot path
+hands off with `execvp`, the libc P/Invoke layer, and how it is tested.
 
 ## Prerequisites
 
@@ -21,16 +30,17 @@ PID/mount namespaces, cgroups) and no image handling (`pull`, registry client).
 ```
 ccrun/
   CCRun.slnx           .NET 10 XML solution file
+  docs/code-overview/  detailed educational walkthrough of how the runtime works
   src/CCRun/           console app (net10.0)
     Program.cs         entrypoint, delegates to Cli
     Cli.cs             verb dispatch + usage
     ExitCodes.cs       named exit codes
-    RunOptions.cs      argument parsing for `run`
-    Commands/          RunCommand (parent stage) + ChildCommand (__child stage)
-    Native/            libc P/Invoke (unshare, sethostname, geteuid)
+    RunOptions.cs      argument parsing for `run` (--hostname, --rootfs)
+    Commands/          RunCommand (parent stage) + ChildCommand (__child stage: sethostname, chroot, execvp)
+    Native/            libc P/Invoke (unshare, sethostname, chroot, chdir, execvp, geteuid)
     Container/         ReExec (re-launch as child) + ProcessRunner (spawn command)
   tests/CCRun.Tests/   xUnit test project
-  alpine-rootfs/       downloaded Alpine root FS (git-ignored)
+  alpine-rootfs/       downloaded Alpine root FS (git-ignored), used by --rootfs
 ```
 
 ## Build & test
@@ -52,7 +62,16 @@ BIN=src/CCRun/bin/Debug/net10.0/CCRun
 sudo "$BIN" run /bin/sh -c hostname                 # prints: container
 sudo "$BIN" run --hostname web /bin/sh -c hostname  # prints: web
 "$BIN" run true                                     # no sudo → prints the sudo hint, exits 125
+
+# --rootfs chroots into the Alpine tree, then runs its in-tree busybox:
+sudo "$BIN" run --rootfs alpine-rootfs /bin/busybox sh -c 'cat /etc/alpine-release'
+sudo "$BIN" run --rootfs alpine-rootfs /bin/busybox sh   # interactive shell inside the rootfs
+"$BIN" run --rootfs /no/such/dir true               # bad rootfs → "does not exist", exits 125
 ```
+
+Use **absolute** command paths with `--rootfs`: after `chroot`, a bare name is
+resolved against `PATH` *inside* the new root, so `/bin/busybox` is reliable where
+`busybox` may not be.
 
 ### Self-contained publish (later phases / NFR-1)
 
@@ -86,5 +105,6 @@ above has moved on.
 
 - **Phase 1 — command parsing / `run`** ✅ done
 - **Phase 2 — hostname isolation (UTS namespace) + re-exec architecture** ✅ done
-- Phases 3–8 (chroot/pivot_root, more namespaces, cgroups, rootless mode,
+- **Phase 3 — filesystem isolation (`chroot` into a root FS via `--rootfs`)** ✅ done
+- Phases 4–8 (PID/mount/user namespaces + `pivot_root`, cgroups, rootless mode,
   image pull, registry client) are forthcoming.
