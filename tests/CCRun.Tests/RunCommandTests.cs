@@ -35,6 +35,15 @@ public class RunCommandTests
         Assert.Contains("unknown option", err);
     }
 
+    [Fact]
+    public void Run_MissingRootfs_ReturnsRuntimeError()
+    {
+        // Rootfs is validated before any unshare, so this is reachable without root.
+        var (code, err) = Run("run", "--rootfs", "/no/such/rootfs/xyz", "true");
+        Assert.Equal(ExitCodes.RuntimeError, code);
+        Assert.Contains("does not exist", err);
+    }
+
     [SkippableFact]
     public void Run_AsNonRoot_FailsWithSudoHint()
     {

@@ -103,4 +103,57 @@ public class RunOptionsTests
         Assert.Null(opts);
         Assert.Contains("--hostname requires a value", err);
     }
+
+    [Fact]
+    public void RootfsOption_SpaceSeparated()
+    {
+        var (opts, _) = Parse("--rootfs", "/r", "true");
+        Assert.NotNull(opts);
+        Assert.Equal("/r", opts!.Rootfs);
+        Assert.Equal("true", opts.Command);
+    }
+
+    [Fact]
+    public void RootfsOption_EqualsForm()
+    {
+        var (opts, _) = Parse("--rootfs=/r", "true");
+        Assert.NotNull(opts);
+        Assert.Equal("/r", opts!.Rootfs);
+    }
+
+    [Fact]
+    public void DefaultRootfs_IsNull_WhenNoOption()
+    {
+        var (opts, _) = Parse("true");
+        Assert.NotNull(opts);
+        Assert.Null(opts!.Rootfs);
+    }
+
+    [Fact]
+    public void RootfsAndHostname_Combined()
+    {
+        var (opts, _) = Parse("--hostname", "web", "--rootfs", "/r", "/bin/sh");
+        Assert.NotNull(opts);
+        Assert.Equal("web", opts!.Hostname);
+        Assert.Equal("/r", opts.Rootfs);
+        Assert.Equal("/bin/sh", opts.Command);
+    }
+
+    [Fact]
+    public void RootfsWithoutValue_ReturnsNull_WithMessage()
+    {
+        var (opts, err) = Parse("--rootfs");
+        Assert.Null(opts);
+        Assert.Contains("--rootfs requires a value", err);
+    }
+
+    [Fact]
+    public void RootfsAfterCommand_PassesThrough()
+    {
+        var (opts, _) = Parse("echo", "--rootfs", "/r");
+        Assert.NotNull(opts);
+        Assert.Equal("echo", opts!.Command);
+        Assert.Equal(new[] { "--rootfs", "/r" }, opts.CommandArgs);
+        Assert.Null(opts.Rootfs);
+    }
 }

@@ -46,4 +46,57 @@ public class NamespaceIntegrationTests
             File.Delete(tmp);
         }
     }
+
+    // Repo-root-relative alpine rootfs, located by walking up from the test binary
+    // until the ALPINE_FS_ROOT marker is found. Null if not present (tests skip).
+    private static string? FindAlpineRootfs()
+    {
+        for (var dir = new DirectoryInfo(AppContext.BaseDirectory); dir is not null; dir = dir.Parent)
+        {
+            string candidate = Path.Combine(dir.FullName, "alpine-rootfs");
+            if (File.Exists(Path.Combine(candidate, "ALPINE_FS_ROOT")) &&
+                File.Exists(Path.Combine(candidate, "bin", "busybox")))
+                return candidate;
+        }
+        return null;
+    }
+
+    [SkippableFact]
+    public void Chroot_LandsInRootfs_MarkerVisible()
+    {
+        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        string? rootfs = FindAlpineRootfs();
+        Skip.If(rootfs is null, "alpine-rootfs not present");
+
+        // The marker is only reachable at / if the new root is the Alpine tree,
+        // reached via an in-rootfs busybox (FR-3.2/3.3).
+        var (code, _) = Run("run", "--rootfs", rootfs!,
+            "/bin/busybox", "sh", "-c", "[ -f /ALPINE_FS_ROOT ]");
+        Assert.Equal(0, code);
+    }
+
+    [SkippableFact]
+    public void Chroot_CannotEscapeAboveRoot()
+    {
+        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        string? rootfs = FindAlpineRootfs();
+        Skip.If(rootfs is null, "alpine-rootfs not present");
+
+        // `cd ..` from / stays at the root; the marker is still there (FR-3.2).
+        var (code, _) = Run("run", "--rootfs", rootfs!,
+            "/bin/busybox", "sh", "-c", "cd .. && [ -f /ALPINE_FS_ROOT ]");
+        Assert.Equal(0, code);
+    }
+
+    [SkippableFact]
+    public void Chroot_MissingCommandInRootfs_ReturnsNotFound()
+    {
+        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        string? rootfs = FindAlpineRootfs();
+        Skip.If(rootfs is null, "alpine-rootfs not present");
+
+        // Exercises the execvp failure mapping end-to-end.
+        var (code, _) = Run("run", "--rootfs", rootfs!, "/no/such/bin");
+        Assert.Equal(ExitCodes.CommandNotFound, code);
+    }
 }

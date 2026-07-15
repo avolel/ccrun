@@ -17,10 +17,15 @@ internal static class ReExec
     /// <summary>Env var carrying the container hostname parent -> child.</summary>
     public const string HostnameEnv = "CCRUN_HOSTNAME";
 
+    /// <summary>Env var carrying the absolute rootfs path parent -> child (unset => no chroot).</summary>
+    public const string RootfsEnv = "CCRUN_ROOTFS";
+
     public static int RunChild(RunOptions options, TextWriter stderr)
     {
         var psi = new ProcessStartInfo { UseShellExecute = false };
         psi.Environment[HostnameEnv] = options.Hostname;
+        if (options.Rootfs is not null)
+            psi.Environment[RootfsEnv] = options.Rootfs;
 
         // Resolve how to re-invoke *this* program. Published apphost / single-file
         // binaries are invoked directly; under the `dotnet` muxer we must prepend

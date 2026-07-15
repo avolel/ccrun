@@ -43,9 +43,9 @@ public static class Cli
         w.WriteLine("ccrun: a lightweight Linux container runtime");
         w.WriteLine();
         w.WriteLine("usage:");
-        w.WriteLine("  ccrun run [--hostname <name>] <command> [args...]   run a command in a container");
+        w.WriteLine("  ccrun run [--hostname <name>] [--rootfs <path>] <command> [args...]   run a command in a container");
         w.WriteLine("  ccrun --help                    show this help");
         w.WriteLine();
-        w.WriteLine("Phase 2: 'run' isolates the hostname in a new UTS namespace (needs sudo).");
+        w.WriteLine("Phase 3: 'run' isolates the hostname (UTS ns) and, with --rootfs, chroots into a root FS (needs sudo).");
     }
 }
