@@ -46,6 +46,8 @@ public static class Cli
         w.WriteLine("  ccrun run [--hostname <name>] [--rootfs <path>] <command> [args...]   run a command in a container");
         w.WriteLine("  ccrun --help                    show this help");
         w.WriteLine();
-        w.WriteLine("Phase 3: 'run' isolates the hostname (UTS ns) and, with --rootfs, chroots into a root FS (needs sudo).");
+        w.WriteLine("Phase 4: 'run' isolates the hostname (UTS ns). With --rootfs it also chroots into the root FS");
+        w.WriteLine("and adds PID + mount namespaces with a private /proc, so it sees only its own processes.");
+        w.WriteLine("Needs sudo.");
     }
 }

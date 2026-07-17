@@ -99,4 +99,39 @@ public class NamespaceIntegrationTests
         var (code, _) = Run("run", "--rootfs", rootfs!, "/no/such/bin");
         Assert.Equal(ExitCodes.CommandNotFound, code);
     }
+
+    // The two Phase 4 tests below assert on exit codes rather than output: the
+    // rootfs path hands off with execvp, which replaces the process image, so the
+    // command's stdout never reaches our StringWriter seam.
+
+    [SkippableFact]
+    public void PidNamespace_ContainerShellIsPidOne()
+    {
+        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWPID)");
+        string? rootfs = FindAlpineRootfs();
+        Skip.If(rootfs is null, "alpine-rootfs not present");
+
+        // In a fresh PID namespace the exec'd shell is the namespace's init, so $$ is 1
+        // (FR-4.1). Without CLONE_NEWPID it would be some arbitrary host PID.
+        var (code, _) = Run("run", "--rootfs", rootfs!,
+            "/bin/busybox", "sh", "-c", "[ \"$$\" = 1 ]");
+        Assert.Equal(0, code);
+    }
+
+    [SkippableFact]
+    public void PrivateProc_OnlyContainerProcessesVisible()
+    {
+        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWPID)");
+        string? rootfs = FindAlpineRootfs();
+        Skip.If(rootfs is null, "alpine-rootfs not present");
+
+        // A private procfs over a fresh PID namespace lists only our own handful of
+        // PIDs — the shell plus the ls/wc pipeline (FR-4.2, FR-4.5). A host /proc, or
+        // no /proc at all, would count hundreds or zero respectively, so the bounds
+        // catch both failure modes.
+        var (code, _) = Run("run", "--rootfs", rootfs!,
+            "/bin/busybox", "sh", "-c",
+            "c=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l); [ \"$c\" -ge 1 ] && [ \"$c\" -le 4 ]");
+        Assert.Equal(0, code);
+    }
 }
