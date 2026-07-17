@@ -1,3 +1,5 @@
+using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 
 namespace ccrun;
@@ -55,6 +57,7 @@ public static class RunCommand
         {
             flags |= Libc.CLONE_NEWNS | Libc.CLONE_NEWPID;
             flagNames += "|CLONE_NEWNS|CLONE_NEWPID";
+            WarmUpProcessSubsystem();
         }
 
         if (Libc.Unshare(flags) != 0)
@@ -68,5 +71,48 @@ public static class RunCommand
         }
 
         return ReExec.RunChild(options with { Rootfs = rootfs }, stderr);
+    }
+
+    /// <summary>
+    /// Forces the one-time initialization behind <see cref="Process.Start"/> to happen
+    /// *before* we unshare the PID namespace. Must be called immediately prior.
+    /// </summary>
+    /// <remarks>
+    /// This looks pointless and is not. Per clone(2), CLONE_THREAD fails with EINVAL if
+    /// the caller has previously called unshare(CLONE_NEWPID) — a new thread would have
+    /// to join a thread group whose PID namespace no longer matches its own. In other
+    /// words, once we unshare the PID namespace this process can never create another
+    /// thread for as long as it lives. Forking a *process* stays legal, which is the
+    /// only reason the re-exec works at all.
+    ///
+    /// That collides with the .NET runtime creating threads lazily: the first
+    /// Process.Start spins up a SIGCHLD-handling thread, and if that first call lands
+    /// after the unshare the runtime aborts with "Win32Exception (22): Invalid
+    /// argument" out of Process.EnsureInitialized. So we make the first call happen
+    /// here, while thread creation still works, and the real one in ReExec then reuses
+    /// the already-running thread.
+    ///
+    /// The start is expected to fail: Process.Start runs the initialization we are
+    /// after before it tries to exec, so a path that cannot exist warms the runtime
+    /// without spawning a stray process or depending on some binary being on the host.
+    ///
+    /// The corollary constrains anything added between here and the Process.Start in
+    /// ReExec: it must not trigger further lazy runtime initialization. Writing to the
+    /// console is the notable trap — Console shares this same signal-handling thread,
+    /// so a stray Console write after the unshare aborts just as hard.
+    /// </remarks>
+    private static void WarmUpProcessSubsystem()
+    {
+        try
+        {
+            using var _ = Process.Start(new ProcessStartInfo("/nonexistent/ccrun-warmup")
+            {
+                UseShellExecute = false,
+            });
+        }
+        catch (Win32Exception)
+        {
+            // Expected — the exec fails, but the initialization we came for has run.
+        }
     }
 }

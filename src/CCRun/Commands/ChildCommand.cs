@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -36,6 +37,16 @@ public static class ChildCommand
         string? rootfs = Environment.GetEnvironmentVariable(ReExec.RootfsEnv);
         if (rootfs is not null)
         {
+            // Everything below runs after chroot, where the .NET runtime's own assemblies
+            // sit outside the new root and can no longer be loaded on demand. Console
+            // initializes itself lazily on its first real write, pulling in
+            // Microsoft.Win32.Primitives — so a failure message from any step below would
+            // try to load it from an unreachable path and die with a FileNotFoundException,
+            // losing the diagnostic and the exit code both. Get that assembly resident now,
+            // while the runtime directory is still reachable. (Libc.LastErrorMessage dodges
+            // the same trap by using strerror instead of Win32Exception; see Libc.)
+            PreloadConsoleWriteDependencies();
+
             // We are PID 1 of a fresh PID namespace, inside a fresh mount namespace.
             // Before touching any mount, mark the inherited tree private so nothing we
             // mount below (notably /proc) propagates back into the host's mount
@@ -89,6 +100,16 @@ public static class ChildCommand
 
         // No rootfs => Phase 2 behavior; Process.Start is safe without a chroot.
         return ProcessRunner.Run(args[0], args[1..], stderr);
+    }
+
+    // Pre-loads the assembly that Console's first-write terminal initialization needs, by
+    // constructing a throwaway instance of a type that lives in it (Win32Exception is in
+    // Microsoft.Win32.Primitives). Triggering that initialization directly would mean
+    // actually writing bytes into the container's output, so we settle for making sure
+    // the assembly is already resident by the time the first write happens.
+    private static void PreloadConsoleWriteDependencies()
+    {
+        _ = new Win32Exception(0);
     }
 
     // Hands off to the command via execvp(2); only returns if the exec fails.

@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Runtime.InteropServices;
 
 namespace ccrun;
@@ -75,7 +74,27 @@ internal static partial class Libc
     [LibraryImport("libc", EntryPoint = "geteuid")]
     internal static partial uint Geteuid();
 
-    /// <summary>Human-readable message for the last failed P/Invoke's errno.</summary>
-    public static string LastErrorMessage() =>
-        new Win32Exception(Marshal.GetLastPInvokeError()).Message;
+    /// <summary>Returns libc's static message buffer for <paramref name="errnum"/>.</summary>
+    [LibraryImport("libc", EntryPoint = "strerror")]
+    private static partial IntPtr Strerror(int errnum);
+
+    /// <summary>
+    /// Human-readable message for the last failed P/Invoke's errno.
+    /// </summary>
+    /// <remarks>
+    /// This goes through libc's strerror rather than the more idiomatic
+    /// <c>new Win32Exception(errno).Message</c> on purpose. Win32Exception lives in
+    /// Microsoft.Win32.Primitives, which the runtime loads lazily on first use — and
+    /// the child stage's failure paths run *after* chroot, where the runtime's own
+    /// assemblies are no longer reachable under the new root. Constructing one there
+    /// killed the process with a FileNotFoundException instead of reporting the error
+    /// (and returning the right exit code). strerror is a plain libc call that needs
+    /// nothing loaded, so the diagnostics survive the chroot.
+    /// </remarks>
+    public static string LastErrorMessage()
+    {
+        int err = Marshal.GetLastPInvokeError();
+        IntPtr msg = Strerror(err);
+        return msg == IntPtr.Zero ? $"errno {err}" : Marshal.PtrToStringUTF8(msg) ?? $"errno {err}";
+    }
 }
