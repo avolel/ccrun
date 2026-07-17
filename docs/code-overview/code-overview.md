@@ -157,7 +157,7 @@ opt-in and backward compatible.
 
 ### The parent stage: creating the namespace
 
-[RunCommand.Execute](../../src/CCRun/Commands/RunCommand.cs#L18) is the host stage. It
+[RunCommand.Execute](../../src/CCRun/Commands/RunCommand.cs#L20) is the host stage. It
 does three things in order, and the order is deliberate.
 
 First it **validates the rootfs before touching any namespaces.** If `--rootfs`
@@ -221,15 +221,66 @@ to be PID 1 of the new namespace. The kernel works this way because a process's
 PID is visible to and cached by everything around it; silently renumbering a
 running process would break it. A namespace's init has to be *born* into it.
 
-That is a happy accident for CCRun rather than an obstacle. The very next fork is
-the `__child` that `ReExec` launches, which then `execvp`s the user's command. So
-the user's command *is* PID 1 of the container, with no extra work — exactly what
-we want before mounting a private `/proc`.
+That half of it is a happy accident for CCRun. The very next fork is the `__child`
+that `ReExec` launches, which then `execvp`s the user's command. So the user's
+command *is* PID 1 of the container, with no extra work — exactly what we want
+before mounting a private `/proc`.
+
+The other half of it is a trap, and it is the subject of the next section.
 
 If `unshare` fails with `EPERM`, CCRun prints a hint telling the user to re-run
 under sudo. This is the common case for anyone who forgets, and a helpful message
 beats a bare "operation not permitted." Root is required because creating a
 namespace needs `CAP_SYS_ADMIN`, and that changes in Phase 5 with rootless mode.
+
+### The line just above the unshare
+
+There is one more call in `RunCommand` that looks like dead code and is load-bearing:
+
+```csharp
+if (rootfs is not null)
+{
+    ...
+    WarmUpProcessSubsystem();
+}
+```
+
+It starts a process at a path that deliberately does not exist, and throws the
+resulting exception away. Deleting it makes `ccrun run --rootfs ...` abort every
+time with `Win32Exception (22): Invalid argument`.
+
+The reason is a rule in `clone(2)` that is easy to miss:
+
+> **EINVAL**: CLONE_THREAD was specified, but the current process previously called
+> unshare(2) with the CLONE_NEWPID flag.
+
+Read that carefully, because it is stronger than it first looks. Threads are
+created with `CLONE_THREAD`. So **once a process calls
+`unshare(CLONE_NEWPID)`, it can never create another thread for as long as it
+lives.** The kernel enforces this because every thread in a thread group must share
+one PID namespace, and the unshare has just pointed this process's *children* at a
+different namespace than the one it is in itself — so a new thread would have no
+consistent namespace to belong to. Creating a *process* stays perfectly legal,
+which is the only reason the re-exec works at all.
+
+Now recall that the .NET runtime does almost everything lazily. `Process.Start`
+needs a SIGCHLD-handling thread to reap children, and it creates that thread on the
+*first* call, inside `Process.EnsureInitialized`. Our first call is the re-exec —
+which happens after the unshare. The runtime tries to create its thread, the kernel
+says EINVAL, and the whole process aborts before the container ever starts.
+
+So the fix is to move that one-time initialization to before the unshare, while
+thread creation is still legal. `Process.Start` runs the initialization before it
+tries to exec, so a start that is guaranteed to fail warms the runtime without
+spawning a stray process or depending on some binary existing on the host.
+
+The corollary is the part worth internalizing: between the unshare and the
+`Process.Start` in `ReExec`, **no code may trigger lazy runtime initialization that
+needs a thread.** Console is the trap waiting for the next person — it shares that
+same signal-handling thread, so a single stray `Console.WriteLine` on that path
+aborts just as hard as `Process.Start` did. This is the sort of constraint that is
+invisible in the source and obvious in a stack trace, which is exactly why it is
+written down here and in a comment at the call site.
 
 An important subtlety: at this point only the parent is in the new UTS and mount
 namespaces (and, as just discussed, not in the PID namespace at all). The parent
@@ -310,7 +361,7 @@ exits 3. A caller's `echo $?` sees the real answer.
 
 ### The child stage: hostname, chroot, /proc, hand-off
 
-[ChildCommand.Execute](../../src/CCRun/Commands/ChildCommand.cs#L19) is the init stage,
+[ChildCommand.Execute](../../src/CCRun/Commands/ChildCommand.cs#L20) is the init stage,
 now running inside the namespaces the parent created — and, on the rootfs path, as
 PID 1 of the new PID namespace. This is where the container is actually assembled.
 
@@ -368,7 +419,7 @@ directory outside its new root, and it can walk upward from there with `..` and
 escape the jail entirely. Calling `chdir("/")` right after the chroot moves the
 working directory to the new root, so there is no dangling handle to climb. This
 is exactly what the integration test
-[Chroot_CannotEscapeAboveRoot](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L79)
+[Chroot_CannotEscapeAboveRoot](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L101)
 verifies: from inside the container, `cd ..` at `/` stays at `/`.
 
 It is worth being honest about what chroot does *not* do, because this is where
@@ -463,7 +514,7 @@ it, and returns its exit code. Simple and safe.
 
 On the chroot path, CCRun instead calls
 [execvp(2)](https://man7.org/linux/man-pages/man2/execvp.2.html) through
-[ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L95), which *replaces* the
+[ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L115), which *replaces* the
 current process image with the command. After a successful `execvp`, there is no
 more .NET code running at all; the process has become BusyBox (or whatever the
 command is). `execvp` only returns if the exec fails.
@@ -476,6 +527,18 @@ them after the chroot, it may fail, and it may fail non-deterministically
 depending on what has already been loaded. So the rule on the chroot path is: do
 no more managed work. Hand off to the command by replacing the process entirely,
 which needs nothing from the old root.
+
+That rule has a sharp edge that Phase 4 found the hard way, and it is the same
+shape as the thread problem in the parent. "Do no more managed work" has to include
+the *error paths*, and they are the easiest thing in the world to forget, because
+they are exactly the code you do not run when everything works. Reporting "cannot
+exec that command" means writing to stderr, and Console — which has not
+necessarily written anything yet in this process — initializes itself on first
+write by loading another assembly from the runtime directory that the chroot just
+made unreachable. The result was a process that died with a `FileNotFoundException`
+instead of printing the error and exiting 127. `ChildCommand` therefore forces that
+assembly resident before the chroot, alongside the `strerror` change in `Libc`
+described earlier. Both exist so that the failure paths can still *report* failure.
 
 The non-chroot path has no such problem. There was no chroot, the runtime's files
 are all still reachable, so `Process.Start` is perfectly safe, and keeping it has
@@ -508,20 +571,33 @@ Two conventions run through the file.
 `SetLastError = true`, and there is a helper:
 
 ```csharp
-public static string LastErrorMessage() =>
-    new Win32Exception(Marshal.GetLastPInvokeError()).Message;
+public static string LastErrorMessage()
+{
+    int err = Marshal.GetLastPInvokeError();
+    IntPtr msg = Strerror(err);
+    return msg == IntPtr.Zero ? $"errno {err}" : Marshal.PtrToStringUTF8(msg) ?? $"errno {err}";
+}
 ```
 
 When a syscall returns its failure value, `Marshal.GetLastPInvokeError` retrieves
-the errno the kernel set, and wrapping it in a `Win32Exception` turns that number
-into a human-readable string. Despite the Windows-flavored name, this works on
-Linux and gives you messages like "Operation not permitted" instead of a bare
-`1`. Every failure path in the commands uses this, so the diagnostics are always
-in terms a person can act on.
+the errno the kernel set, and `strerror` turns that number into a human-readable
+string like "Operation not permitted" instead of a bare `1`. Every failure path in
+the commands uses this, so the diagnostics are always in terms a person can act on.
+
+The idiomatic .NET way to write that is `new Win32Exception(errno).Message`, which
+works fine on Linux despite the Windows-flavored name, and that is what this
+project used until Phase 4. It had to go, for a reason that is a good introduction
+to the next section: `Win32Exception` lives in `Microsoft.Win32.Primitives`, which
+the runtime loads *lazily, from disk, on first use*. The child stage's failure
+paths run after `chroot`, where the runtime's own assemblies are no longer
+reachable. So the very act of reporting "cannot exec that command" would itself
+fail — with a `FileNotFoundException` that killed the process outright, losing both
+the diagnostic and the exit code. `strerror` is a plain libc call that needs
+nothing loaded, so it survives the chroot.
 
 **The NULL-terminated argv trick.** `execvp` expects a C array of string
 pointers terminated by a null pointer, with `argv[0]` conventionally the program
-name. [ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L95) builds this by
+name. [ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L115) builds this by
 allocating one extra slot and leaving it null:
 
 ```csharp
@@ -591,20 +667,44 @@ so on an ordinary unprivileged machine or CI run they skip cleanly and
 pipeline: unshare, re-exec, sethostname, chroot, the `/proc` mount, and the
 `execvp` hand-off into an in-rootfs BusyBox.
 
-The Phase 4 tests there are worth a look, because asserting on isolation is a
-slightly odd exercise. Both check exit codes rather than output, since `execvp`
-replaces the process image and the command's stdout never reaches the
-`StringWriter` seam the other tests use — so the assertion has to be pushed *into*
-the container, as a shell expression whose truth value becomes the exit code.
-`PidNamespace_ContainerShellIsPidOne` runs `[ "$$" = 1 ]`: in a fresh PID namespace
-the exec'd shell is init, so `$$` is 1, and without `CLONE_NEWPID` it would be some
-arbitrary host PID. `PrivateProc_OnlyContainerProcessesVisible` counts the numeric
-entries in `/proc` and requires between 1 and 4 — the shell plus its `ls`/`wc`
-pipeline. The bounds catch both ways this can break: a host `/proc` would count in
-the hundreds, and a missing `/proc` mount would count zero.
+They also do not need sudo, which is worth knowing while developing them. An
+unprivileged user namespace hands you `CAP_SYS_ADMIN` and `CAP_SYS_CHROOT` *inside*
+it, which is exactly what ccrun wants, so the whole suite runs unprivileged with:
+
+```sh
+unshare --user --map-root-user dotnet test
+```
+
+Unlike every other test class, these spawn the ccrun **binary** rather than calling
+`Cli.Run` in-process, and that is a hard requirement rather than a style choice.
+`run` calls `unshare(2)`, which permanently mutates the calling process — and
+in-process, the calling process is the xunit test host. A stray UTS namespace is
+survivable. A PID namespace is not: per the rule above the test host could no
+longer create threads, and worse, once the container's PID 1 exits, the namespace
+has no init, so every subsequent `fork(2)` from that process fails with `ENOMEM`.
+A single in-process rootfs test would wedge the host and take down every test that
+ran after it, producing a cascade of failures with nothing to do with the code
+under test. Spawning a fresh process per run confines each test's namespace damage
+to itself.
+
+The out-of-process design pays a bonus: stdout is a real inherited file
+descriptor, so these tests can assert on what the container actually printed, even
+across the `execvp` hand-off that replaces the process image and would defeat an
+in-process `StringWriter`. `PidNamespace_ContainerShellIsPidOne` just runs
+`echo $$` and asserts the output is `1`. `PrivateProc_OnlyContainerProcessesVisible`
+counts the numeric entries in `/proc` and requires between 1 and 4 — the shell plus
+its `ls`/`wc` pipeline. Those bounds catch both ways it can break: the host's
+`/proc` counts in the hundreds, and a missing `/proc` mount counts zero.
+
+`MountNamespace_ContainerProcMountNotVisibleOnHost` is the fiddliest of them,
+because FR-4.3 is a claim about what is true *while a container is running*.
+Checking the host's mount table after the container exits proves little, since the
+mount is gone either way. So the container touches a marker file and then idles;
+the test polls for the marker, reads `/proc/self/mounts` on the host while the
+container is definitely live, and kills it in a `finally`.
 
 The chroot tests have a second gate. They call a small helper,
-[FindAlpineRootfs](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L52), that walks
+[FindAlpineRootfs](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L74), that walks
 up from the test binary's directory looking for `alpine-rootfs/ALPINE_FS_ROOT`
 and a real `bin/busybox`. If the Alpine rootfs is not present on the machine,
 those tests skip too, rather than failing. The rootfs is git-ignored, so this
@@ -619,11 +719,14 @@ no sudo. Only the genuinely privileged behavior needs a privileged test.
 
 The two-stage architecture was not built just for hostname and chroot. It exists
 because the later phases *require* setup to happen in a freshly namespaced child,
-and Phase 2 paid that cost up front so the rest could slot in. Phase 4 is the
-proof: it added the PID and mount namespaces and a private `/proc` without
-introducing a single new structural piece, because the PID-namespace fork ordering
-and the `execvp` hand-off were already exactly what a proper PID 1 needs. Here is
-the rest of the trajectory:
+and Phase 2 paid that cost up front so the rest could slot in. Phase 4 mostly bore
+that out: the PID and mount namespaces and the private `/proc` slotted into the
+existing two stages without new structure, because the fork ordering and the
+`execvp` hand-off were already what a proper PID 1 needs. What it did *not*
+anticipate was how much the .NET runtime's laziness would fight a process that has
+unshared a PID namespace or chroot'd away from its own assemblies — hence the two
+warm-ups and the move off `Win32Exception`. The architecture held; the runtime
+underneath it needed coaxing. Here is the rest of the trajectory:
 
 - **Phase 5** adds cgroup v2 for CPU and memory limits, and rootless mode, which
   uses a user namespace to obtain the capabilities that today force `sudo`. This

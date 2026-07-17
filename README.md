@@ -87,6 +87,17 @@ appears on the host (`mount | grep alpine-rootfs/proc` finds nothing while a
 container runs) and the kernel tears it down automatically when the container
 exits — there is no cleanup step to forget.
 
+`--rootfs` is resolved against your **current directory**, so run these from the
+repo root or pass an absolute path.
+
+Prefer not to type `sudo`? An unprivileged user namespace grants the capabilities
+ccrun needs inside it, which also makes the root-gated tests run instead of skip:
+
+```sh
+unshare --user --map-root-user "$BIN" run --rootfs alpine-rootfs /bin/busybox ps
+unshare --user --map-root-user dotnet test
+```
+
 Use **absolute** command paths with `--rootfs`: after `chroot`, a bare name is
 resolved against `PATH` *inside* the new root, so `/bin/busybox` is reliable where
 `busybox` may not be.

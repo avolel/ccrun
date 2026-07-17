@@ -32,7 +32,8 @@ re-runs ccrun in a hidden `__child` stage that does the in-namespace setup
 (`sethostname`, then the optional make-private mount + `chroot` + `/proc` mount)
 before launching the user command.
 
-Two non-obvious mechanics worth knowing before editing:
+Non-obvious mechanics worth knowing before editing — the last two are landmines
+that will abort the runtime at startup if disturbed:
 
 - **`unshare(CLONE_NEWPID)` does not move the caller.** It makes the *next* forked
   process PID 1. That fork is the `__child` the parent re-execs, so the user's
@@ -41,6 +42,20 @@ Two non-obvious mechanics worth knowing before editing:
   namespace, which the kernel destroys once the PID namespace empties, on success
   and error paths alike. Explicit unmounting would be impossible after `execvp`
   replaces the process image anyway.
+- **After `unshare(CLONE_NEWPID)` a process can never create a thread again.**
+  `clone(2)` rejects `CLONE_THREAD` with `EINVAL` for such a process (forking a
+  *process* stays fine). Since .NET creates threads lazily, `RunCommand`
+  deliberately triggers `Process.Start`'s one-time init *before* the unshare
+  (`WarmUpProcessSubsystem`) — without it, `run --rootfs` aborts with
+  `Win32Exception (22)`. Nothing between that unshare and the `Process.Start` in
+  `ReExec` may trigger lazy runtime init; **a stray `Console` write there is enough
+  to abort**, since Console shares the same signal-handling thread.
+- **After `chroot`, the runtime's assemblies are unreachable, so error paths must
+  load nothing.** `Libc.LastErrorMessage` uses `strerror` rather than
+  `Win32Exception` (which lives in a lazily-loaded assembly), and `ChildCommand`
+  forces that assembly resident before the chroot (`PreloadConsoleWriteDependencies`) because
+  Console's first write needs it. Without both, a failing `execvp` died with a
+  `FileNotFoundException` instead of reporting the error and exiting 127.
 
 On the chroot path the child hands off with `execvp` (replacing its process image)
 rather than `Process.Start`, because after `chroot` the .NET runtime's own files
@@ -76,6 +91,18 @@ sudo src/CCRun/bin/Debug/net10.0/CCRun run --rootfs alpine-rootfs /bin/busybox s
 sudo src/CCRun/bin/Debug/net10.0/CCRun run --rootfs alpine-rootfs /bin/busybox ps               # only container procs
 ```
 
+Note `--rootfs` paths resolve against the **current directory**, so run from the
+repo root (or pass an absolute path).
+
+Both ccrun and the root-gated tests can be run **without sudo** inside an
+unprivileged user namespace, which grants `CAP_SYS_ADMIN`/`CAP_SYS_CHROOT` inside
+it. This is the quickest way to exercise the namespace tests, which otherwise skip:
+
+```sh
+unshare --user --map-root-user dotnet test                       # runs the root-gated tests
+unshare --user --map-root-user src/CCRun/bin/Debug/net10.0/CCRun run --rootfs alpine-rootfs /bin/busybox ps
+```
+
 ## Structure
 
 - `src/CCRun/` — the CLI console app (`net10.0`). `Program.cs` is a thin
@@ -87,8 +114,9 @@ sudo src/CCRun/bin/Debug/net10.0/CCRun run --rootfs alpine-rootfs /bin/busybox p
   `ChildCommand` is the re-exec'd `__child` init stage (`sethostname`, then on the
   rootfs path: recursive make-private mount → `chroot` → `chdir("/")` → mount
   `/proc` → `execvp`). `Native/Libc.cs` holds the libc P/Invoke declarations
-  (`unshare`, `sethostname`, `chroot`, `chdir`, `mount`, `execvp`, `geteuid`) and
-  the constants they need (`CLONE_NEWUTS`/`CLONE_NEWNS`/`CLONE_NEWPID`, the
+  (`unshare`, `sethostname`, `chroot`, `chdir`, `mount`, `execvp`, `geteuid`,
+  `strerror`) and the constants they need
+  (`CLONE_NEWUTS`/`CLONE_NEWNS`/`CLONE_NEWPID`, the
   `MS_NOSUID`/`MS_NODEV`/`MS_NOEXEC`/`MS_REC`/`MS_PRIVATE` mount flags, plus
   `EACCES`/`EPERM`).
   `Container/` holds the runtime plumbing: `ReExec` re-launches ccrun as its own
@@ -102,12 +130,16 @@ sudo src/CCRun/bin/Debug/net10.0/CCRun run --rootfs alpine-rootfs /bin/busybox p
   `RunCommandTests` covers the parent stage, including the "needs sudo" failure
   and the missing-`--rootfs` error; `NamespaceIntegrationTests` exercises the
   full unshare + sethostname + chroot + `/proc` + execvp pipeline, including the
-  PID-1 and private-`/proc` assertions. Those two assert on exit codes rather than
-  output, because `execvp` replaces the process image and its stdout never reaches
-  the `StringWriter` seam. The namespace tests need
-  root, so they skip automatically (via `Xunit.SkippableFact`) when `dotnet test`
-  runs unprivileged; the chroot tests additionally skip if `alpine-rootfs/` is
-  absent.
+  PID-1, private-`/proc`, and host-mount-isolation assertions. The namespace tests
+  need root, so they skip automatically (via `Xunit.SkippableFact`) when
+  `dotnet test` runs unprivileged; the chroot tests additionally skip if
+  `alpine-rootfs/` is absent.
+  **`NamespaceIntegrationTests` must spawn the ccrun binary out-of-process** (it
+  does, via `dotnet <testdir>/CCRun.dll`), never `Cli.Run` in-process like the
+  other classes: `unshare` mutates its caller, so an in-process rootfs test would
+  leave the xunit test host unable to create threads and — once the container's
+  PID 1 exits — unable to `fork` at all (`ENOMEM`), failing every test after it.
+  Running out-of-process also makes the container's real stdout assertable.
 - `alpine-rootfs/` — Alpine minirootfs, **git-ignored**, the rootfs used by
   `--rootfs` for chroot testing. Recreate via the commands in README.md if
   missing; presence is verified by the `ALPINE_FS_ROOT` marker file and
