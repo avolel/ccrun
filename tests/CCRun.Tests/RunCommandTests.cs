@@ -2,14 +2,34 @@ using ccrun;
 
 namespace CCRun.Tests;
 
-// Parent/host-stage behaviour through the Cli.Run seam. Cases that would need a
-// real UTS namespace (which requires CAP_SYS_ADMIN) live in
-// NamespaceIntegrationTests; here we cover the paths that fail before unshare
-// or via the EPERM hint, so this class stays green for a non-root dev/CI.
+// Parent/host-stage behaviour through the Cli.Run seam. Anything that actually
+// unshares lives in NamespaceIntegrationTests and runs out of process: unshare(2)
+// mutates its caller, which in-process would be the xunit test host. What is left
+// here is the paths that return *before* any unshare — argument parsing and rootfs
+// validation — so this class needs no privileges at all.
 public class RunCommandTests
 {
-    // euid 0 => running as root; unshare(CLONE_NEWUTS) would succeed.
+    // euid 0 => running as root (e.g. under sudo).
     internal static bool IsRoot => Libc.Geteuid() == 0;
+
+    // ccrun now always creates a user namespace, so the integration tests need either
+    // root or a kernel that lets unprivileged users create one. Both knobs below are
+    // opt-out gates: Debian/Ubuntu ship the unprivileged_userns_clone toggle, and
+    // max_user_namespaces caps how many a user may own (0 disables them outright).
+    internal static bool IsUserNsAvailable => IsRoot || UnprivilegedUsernsEnabled();
+
+    private static bool UnprivilegedUsernsEnabled()
+    {
+        const string knob = "/proc/sys/kernel/unprivileged_userns_clone";
+        if (File.Exists(knob) && File.ReadAllText(knob).Trim() == "0")
+            return false;
+
+        const string max = "/proc/sys/user/max_user_namespaces";
+        if (File.Exists(max) && int.TryParse(File.ReadAllText(max).Trim(), out int n) && n <= 0)
+            return false;
+
+        return true;
+    }
 
     private static (int code, string err) Run(params string[] args)
     {
@@ -42,16 +62,5 @@ public class RunCommandTests
         var (code, err) = Run("run", "--rootfs", "/no/such/rootfs/xyz", "true");
         Assert.Equal(ExitCodes.RuntimeError, code);
         Assert.Contains("does not exist", err);
-    }
-
-    [SkippableFact]
-    public void Run_AsNonRoot_FailsWithSudoHint()
-    {
-        Skip.If(IsRoot, "requires a non-root euid to hit the EPERM hint path");
-
-        // The failed unshare is a no-op, so nothing on the host is mutated.
-        var (code, err) = Run("run", "true");
-        Assert.Equal(ExitCodes.RuntimeError, code);
-        Assert.Contains("sudo", err);
     }
 }

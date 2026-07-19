@@ -12,6 +12,13 @@ internal static partial class Libc
     /// <summary>Flag for <see cref="Unshare"/>: new UTS namespace (hostname).</summary>
     public const int CLONE_NEWUTS = 0x04000000;
 
+    /// <summary>
+    /// Flag for <see cref="Unshare"/>: new user namespace. The caller gets a full set of
+    /// capabilities *inside* the new namespace, which is what lets an unprivileged user
+    /// perform the other unshares, the chroot and the mounts (FR-5.1).
+    /// </summary>
+    public const int CLONE_NEWUSER = 0x10000000;
+
     /// <summary>Flag for <see cref="Unshare"/>: new mount namespace (private mount table).</summary>
     public const int CLONE_NEWNS = 0x00020000;
 
@@ -36,8 +43,32 @@ internal static partial class Libc
     /// <summary>mount(2): turn off mount/unmount propagation to and from peers.</summary>
     public const ulong MS_PRIVATE = 1UL << 18;
 
+    /// <summary>
+    /// clone3(2) syscall number. Unlike clone(2), whose number differs per architecture
+    /// (and whose argument order differs too), clone3 is 435 everywhere — which keeps
+    /// the x64/arm64 story simple.
+    /// </summary>
+    public const long SYS_clone3 = 435;
+
+    /// <summary>
+    /// Size of the original <c>struct clone_args</c> (CLONE_ARGS_SIZE_VER0). The kernel
+    /// takes the struct size as an argument and uses it to tell which version the caller
+    /// was built against, so passing the smallest one works on every kernel that has
+    /// clone3 at all.
+    /// </summary>
+    public const nuint CLONE_ARGS_SIZE_VER0 = 64;
+
+    /// <summary>Signal delivered to the parent when the cloned child exits; makes it waitable.</summary>
+    public const ulong SIGCHLD = 17;
+
     /// <summary>errno EPERM — operation not permitted (needs CAP_SYS_ADMIN / root).</summary>
     public const int EPERM = 1;
+
+    /// <summary>errno EINVAL — invalid argument.</summary>
+    public const int EINVAL = 22;
+
+    /// <summary>errno ENOSYS — syscall not implemented by this kernel.</summary>
+    public const int ENOSYS = 38;
 
     /// <summary>errno EACCES — permission denied (e.g. target not executable).</summary>
     public const int EACCES = 13;
@@ -71,8 +102,52 @@ internal static partial class Libc
     [LibraryImport("libc", EntryPoint = "execvp", SetLastError = true, StringMarshalling = StringMarshalling.Utf8)]
     internal static partial int Execvp(string file, string?[] argv);
 
+    /// <summary>
+    /// Raw syscall(2) escape hatch, used for clone3 — glibc exposes no wrapper for it.
+    /// Declared with fixed arguments rather than varargs, which is safe here because the
+    /// System V x86-64 and AArch64 calling conventions pass these integer arguments in the
+    /// same registers either way.
+    /// </summary>
+    [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
+    internal static partial long Syscall(long number, IntPtr arg1, nuint arg2);
+
+    /// <summary>pipe(2): fds[0] is the read end, fds[1] the write end.</summary>
+    [LibraryImport("libc", EntryPoint = "pipe", SetLastError = true)]
+    internal static partial int Pipe([Out] int[] fds);
+
+    [LibraryImport("libc", EntryPoint = "read", SetLastError = true)]
+    internal static partial nint Read(int fd, IntPtr buf, nuint count);
+
+    [LibraryImport("libc", EntryPoint = "write", SetLastError = true)]
+    internal static partial nint Write(int fd, IntPtr buf, nuint count);
+
+    [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
+    internal static partial int Close(int fd);
+
+    /// <summary>
+    /// execve(2) taking already-marshalled native pointers. The pointer-based signature is
+    /// deliberate: this runs in a freshly cloned child where allocating (which string
+    /// marshalling would do) is unsafe — see <see cref="ReExec"/>.
+    /// </summary>
+    [LibraryImport("libc", EntryPoint = "execve", SetLastError = true)]
+    internal static partial int Execve(IntPtr path, IntPtr argv, IntPtr envp);
+
+    /// <summary>
+    /// _exit(2): terminates immediately without running atexit handlers or flushing
+    /// stdio. The abrupt variant is the point — a cloned child must not run the .NET
+    /// runtime's shutdown path.
+    /// </summary>
+    [LibraryImport("libc", EntryPoint = "_exit")]
+    internal static partial void Exit(int status);
+
+    [LibraryImport("libc", EntryPoint = "waitpid", SetLastError = true)]
+    internal static partial int Waitpid(int pid, out int status, int options);
+
     [LibraryImport("libc", EntryPoint = "geteuid")]
     internal static partial uint Geteuid();
+
+    [LibraryImport("libc", EntryPoint = "getegid")]
+    internal static partial uint Getegid();
 
     /// <summary>Returns libc's static message buffer for <paramref name="errnum"/>.</summary>
     [LibraryImport("libc", EntryPoint = "strerror")]

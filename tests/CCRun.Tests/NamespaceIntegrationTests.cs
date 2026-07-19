@@ -4,12 +4,11 @@ using ccrun;
 namespace CCRun.Tests;
 
 // Full parent -> re-exec -> child pipeline, exercised end to end against the real
-// CCRun binary. Creating namespaces needs CAP_SYS_ADMIN, so every test here is
-// gated on root and skips for a normal non-root dev/CI (keeping `dotnet test`
-// green). Run them with `sudo dotnet test`, or without sudo inside an
-// unprivileged user namespace:
-//
-//     unshare --user --map-root-user dotnet test
+// CCRun binary. Since Phase 5 ccrun creates a user namespace first and does the rest
+// with the capabilities that grants, so plain `dotnet test` exercises all of this
+// unprivileged. The gate is therefore only "can this machine create a user
+// namespace" — root also qualifies — and tests skip on kernels where unprivileged
+// user namespaces are switched off.
 //
 // These run ccrun **out of process** rather than through the Cli.Run seam the
 // other test classes use, and that is not incidental. `run` calls unshare(2),
@@ -51,7 +50,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void FullPipeline_TrueCommand_ReturnsZero()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
 
         // unshare + re-exec + sethostname + spawn, all the way through.
         var (code, _, err) = Run("run", "true");
@@ -62,7 +61,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void Hostname_AppliedInsideContainer()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
 
         var (code, stdout, _) = Run("run", "--hostname", "ccrun-test", "/bin/sh", "-c", "hostname");
         Assert.Equal(0, code);
@@ -86,7 +85,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void Chroot_LandsInRootfs_MarkerVisible()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
         string? rootfs = FindAlpineRootfs();
         Skip.If(rootfs is null, "alpine-rootfs not present");
 
@@ -100,7 +99,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void Chroot_CannotEscapeAboveRoot()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
         string? rootfs = FindAlpineRootfs();
         Skip.If(rootfs is null, "alpine-rootfs not present");
 
@@ -113,7 +112,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void Chroot_MissingCommandInRootfs_ReturnsNotFound()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWUTS)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
         string? rootfs = FindAlpineRootfs();
         Skip.If(rootfs is null, "alpine-rootfs not present");
 
@@ -125,7 +124,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void PidNamespace_ContainerShellIsPidOne()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWPID)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
         string? rootfs = FindAlpineRootfs();
         Skip.If(rootfs is null, "alpine-rootfs not present");
 
@@ -140,7 +139,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void PrivateProc_OnlyContainerProcessesVisible()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWPID)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
         string? rootfs = FindAlpineRootfs();
         Skip.If(rootfs is null, "alpine-rootfs not present");
 
@@ -158,7 +157,7 @@ public class NamespaceIntegrationTests
     [SkippableFact]
     public void MountNamespace_ContainerProcMountNotVisibleOnHost()
     {
-        Skip.IfNot(RunCommandTests.IsRoot, "requires root for unshare(CLONE_NEWNS)");
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
         string? rootfs = FindAlpineRootfs();
         Skip.If(rootfs is null, "alpine-rootfs not present");
 
@@ -200,5 +199,97 @@ public class NamespaceIntegrationTests
             container.WaitForExit();
             File.Delete(marker);
         }
+    }
+
+    [SkippableFact]
+    public void Rootless_ContainerRootMapsToInvokingUser()
+    {
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
+        string? rootfs = FindAlpineRootfs();
+        Skip.If(rootfs is null, "alpine-rootfs not present");
+
+        // FR-5.2: inside the user namespace the uid map makes us uid 0, whoever ran
+        // ccrun. Before the map is written the kernel reports the overflow uid (65534),
+        // so this also proves the map was applied and not merely attempted.
+        var (code, stdout, _) = Run("run", "--rootfs", rootfs!, "/bin/busybox", "id", "-u");
+        Assert.Equal(0, code);
+        Assert.Equal("0", stdout.Trim());
+    }
+
+    [SkippableFact]
+    public void Rootless_HostSeesProcessOwnedByInvokingUser()
+    {
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
+        Skip.If(RunCommandTests.IsRoot, "meaningful only for a non-root invoker");
+
+        // FR-5.3, the acceptance test: a process that is root *inside* the container must
+        // appear on the host owned by the unprivileged user who launched it. That can only
+        // be observed while the container is alive, so start a long sleep, find it on the
+        // host by its distinctive duration, and read the owner the kernel reports.
+        //
+        // No --rootfs here on purpose: this path uses the host's /bin/sleep and the
+        // lightweight UTS+user namespace setup, which is all FR-5.3 needs.
+        string marker = (DateTime.UtcNow.Ticks % 100000 + 100000).ToString();
+
+        var psi = new ProcessStartInfo("dotnet")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        foreach (var a in new[]
+                 {
+                     Path.Combine(AppContext.BaseDirectory, "CCRun.dll"), "run", "/bin/sleep", marker,
+                 })
+            psi.ArgumentList.Add(a);
+
+        using var container = Process.Start(psi) ?? throw new InvalidOperationException("failed to start ccrun");
+        try
+        {
+            int? pid = null;
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            while (pid is null && !container.HasExited && DateTime.UtcNow < deadline)
+            {
+                pid = FindHostPidByCmdline(marker);
+                if (pid is null)
+                    Thread.Sleep(50);
+            }
+            Assert.True(pid is not null, "container sleep never appeared in the host's /proc");
+
+            // /proc/<pid>/status "Uid:" is real/effective/saved/fs; the effective uid is
+            // the second field. The host resolves it outside the namespace, which is the
+            // whole point — the container's root is our own uid out here.
+            string status = File.ReadAllText($"/proc/{pid}/status");
+            string uidLine = status.Split('\n').First(l => l.StartsWith("Uid:", StringComparison.Ordinal));
+            uint effectiveUid = uint.Parse(uidLine.Split('\t', StringSplitOptions.RemoveEmptyEntries)[2]);
+
+            Assert.Equal(Libc.Geteuid(), effectiveUid);
+            Assert.NotEqual(0u, effectiveUid);
+        }
+        finally
+        {
+            if (!container.HasExited)
+                container.Kill(entireProcessTree: true);
+            container.WaitForExit();
+        }
+    }
+
+    // Scans the host's /proc for a process whose command line contains `needle`. Entries
+    // race with process exit, so unreadable ones are skipped rather than thrown on.
+    private static int? FindHostPidByCmdline(string needle)
+    {
+        foreach (var dir in Directory.EnumerateDirectories("/proc"))
+        {
+            if (!int.TryParse(Path.GetFileName(dir), out int pid))
+                continue;
+            try
+            {
+                if (File.ReadAllText($"{dir}/cmdline").Replace('\0', ' ').Contains(needle))
+                    return pid;
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        return null;
     }
 }

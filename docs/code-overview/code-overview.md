@@ -13,7 +13,7 @@ but the ideas behind it, so this document spends most of its time on the *why*.
 ## Where the project stands
 
 CCRun is planned as eight phases. Each phase adds one real piece of isolation.
-As of this writing the runtime is through **Phase 4**, which means it can do three
+As of this writing the runtime is through **Phase 5**, which means it can do four
 things that matter:
 
 1. **Hostname isolation** (Phase 2). A container gets its own hostname, and
@@ -26,6 +26,10 @@ things that matter:
    namespace, so its process tree starts fresh and the command runs as PID 1; a
    mount namespace, so its mounts are invisible to the host; and a private `/proc`,
    so `ps` inside shows only container processes.
+4. **Rootless operation** (Phase 5). Every container gets a user namespace, in
+   which the invoking user's ID is mapped to 0. The command believes it is root
+   and holds the capabilities the steps above need, while the host still sees an
+   ordinary unprivileged process. `ccrun` no longer needs `sudo`.
 
 That third one is what makes the container start to *feel* like a container. Up
 through Phase 3 you could chroot into Alpine and still see every process on the
@@ -33,7 +37,7 @@ machine, which gives away the illusion immediately.
 
 There is a deliberate asymmetry to understand before reading further: **the Phase 4
 stack is gated on `--rootfs`.** A rootfs run gets everything above; a bare
-`ccrun run` stays at Phase 2, with a UTS namespace and nothing else. The reason is
+`ccrun run` gets the user and UTS namespaces and nothing else. The reason is
 not laziness. The no-rootfs path hands off with managed `Process.Start`, and you do
 not want the .NET runtime to become PID 1 of a PID namespace — PID 1 has special
 kernel duties (notably reaping orphans, and immunity to default signal handling)
@@ -41,16 +45,18 @@ that a runtime never signed up for. Keeping the rule "`--rootfs` means a real
 container, bare `run` means hostname only" makes that boundary obvious and mirrors
 the chroot gate that already existed.
 
-What is still missing: no user namespace, no resource limits via cgroups, and no
-image handling. A real `docker run alpine` pulls an image, remaps user IDs, and
-caps memory and CPU. CCRun does none of that yet. Those are Phases 5 through 8,
-and the code is structured so they slot in cleanly. More on that at the end.
+What is still missing: no resource limits via cgroups, and no image handling. A
+real `docker run alpine` pulls an image and caps memory and CPU. CCRun does
+neither yet. Those are Phases 6 through 8, and the code is structured so they slot
+in cleanly. More on that at the end.
 
-Because creating namespaces, mounting filesystems, and calling `chroot` all require
-Linux capabilities that ordinary users do not have (`CAP_SYS_ADMIN` for the
-namespaces and mounts, `CAP_SYS_CHROOT` for the chroot), `ccrun run` currently
-needs root. Rootless mode, which uses a user namespace to get those capabilities
-without real root, arrives in Phase 5.
+Creating namespaces, mounting filesystems, and calling `chroot` all require Linux
+*capabilities* — individual slices of root's authority, here `CAP_SYS_ADMIN` for
+namespaces and mounts and `CAP_SYS_CHROOT` for the chroot — that ordinary users do
+not have. Until Phase 5 that meant `ccrun run` needed real root. It no longer
+does: the [user namespace section](#the-user-namespace-and-rootless-containers)
+explains how creating one namespace grants the capabilities to create all the
+others.
 
 ## The one idea that shapes everything: two stages
 
@@ -63,18 +69,21 @@ inside fresh namespaces. But some of that setup is awkward or impossible to do t
 *yourself* after the fact. The clean approach, and the one every real runtime
 uses in some form, is:
 
-1. A **parent (host) stage** creates the new namespaces.
-2. It then launches a **child (init) stage**, a brand new process that
-   *inherits* those namespaces from birth.
-3. The child does the in-namespace setup (set the hostname, chroot, later mount
+1. A **parent (host) stage** creates a **child (init) stage** — a brand new
+   process, born directly into fresh namespaces.
+2. The child does the in-namespace setup (set the hostname, chroot, later mount
    `/proc` and so on) and finally hands control to the user's actual command.
+3. The parent waits for it and reports its exit code.
+
+Note "born into" rather than "moved into." Phase 5 made that distinction load-bearing;
+the [user namespace section](#the-user-namespace-and-rootless-containers) explains why.
 
 CCRun implements this by re-executing *itself*. The parent runs
-`ccrun run ...`. After it creates the namespace, it launches `ccrun __child ...`,
+`ccrun run ...` and launches `ccrun __child ...`,
 where `__child` is a hidden verb that means "you are the init stage, finish the
 setup." The same binary plays both roles depending on which verb it is invoked
 with. You will see this hidden verb dispatched in [Cli.cs](../../src/CCRun/Cli.cs#L26)
-and produced in [ReExec.cs](../../src/CCRun/Container/ReExec.cs#L44).
+and produced in [ReExec.cs](../../src/CCRun/Container/ReExec.cs#L276).
 
 Keep this two-stage picture in mind and the rest of the code reads as a straight
 line.
@@ -84,7 +93,7 @@ line.
 Let us trace one concrete invocation all the way through:
 
 ```sh
-sudo ccrun run --rootfs alpine-rootfs /bin/busybox sh
+ccrun run --rootfs alpine-rootfs /bin/busybox sh
 ```
 
 This asks CCRun to start an interactive BusyBox shell inside the Alpine root
@@ -157,7 +166,7 @@ opt-in and backward compatible.
 
 ### The parent stage: creating the namespace
 
-[RunCommand.Execute](../../src/CCRun/Commands/RunCommand.cs#L20) is the host stage. It
+[RunCommand.Execute](../../src/CCRun/Commands/RunCommand.cs#L15) is the host stage. It
 does three things in order, and the order is deliberate.
 
 First it **validates the rootfs before touching any namespaces.** If `--rootfs`
@@ -188,180 +197,249 @@ file. That is on purpose: in Phase 8 the rootfs will come from a pulled image
 that has no such marker, so baking in an Alpine-specific check would be a dead
 end.
 
-Second, it creates the namespaces:
+Second, it decides which namespaces the container gets:
 
 ```csharp
-int flags = Libc.CLONE_NEWUTS;
+ulong flags = (ulong)Libc.CLONE_NEWUSER | (ulong)Libc.CLONE_NEWUTS;
 if (rootfs is not null)
-    flags |= Libc.CLONE_NEWNS | Libc.CLONE_NEWPID;
-
-if (Libc.Unshare(flags) != 0)
+    flags |= (ulong)Libc.CLONE_NEWNS | (ulong)Libc.CLONE_NEWPID;
 ```
 
-[unshare(2)](https://man7.org/linux/man-pages/man2/unshare.2.html) is the
-syscall that says "give the calling process new, private copies of the kernel
-resources named by these flags." Three flags are in play:
+Four flags are in play, each naming one kind of namespace:
 
-- `CLONE_NEWUTS` asks for a new UTS namespace. UTS stands for Unix Time-sharing
-  System, a historical name; in practice it is the namespace that owns the
-  hostname and domain name. After this call succeeds, this process has its own
-  hostname slot, and changing it will not affect the host.
-- `CLONE_NEWNS` asks for a new mount namespace — a private mount table. (The `NS`
-  is another historical artifact: mount namespaces were the first namespace Linux
-  ever had, so they got the generic name.) This is what will keep the `/proc` we
-  are about to mount from ever appearing on the host.
-- `CLONE_NEWPID` asks for a new PID namespace: a fresh process-id number space
+- `CLONE_NEWUSER` asks for a new **user namespace** — a private mapping between
+  user and group IDs inside and outside it. This is the Phase 5 addition and the
+  reason ccrun no longer needs sudo; the next section is devoted to it.
+- `CLONE_NEWUTS` asks for a new **UTS namespace**. UTS stands for Unix
+  Time-sharing System, a historical name; in practice it is the namespace that owns
+  the hostname and domain name. Inside it the container has its own hostname slot,
+  and changing it will not affect the host's.
+- `CLONE_NEWNS` asks for a new **mount namespace** — a private mount table. (The
+  `NS` is another historical artifact: mount namespaces were the first namespace
+  Linux ever had, so they got the generic name.) This is what will keep the `/proc`
+  we are about to mount from ever appearing on the host.
+- `CLONE_NEWPID` asks for a new **PID namespace**: a fresh process-id number space
   starting at 1.
 
-The last one has a quirk that trips people up, and it is worth understanding
-because CCRun's architecture depends on it. **`unshare(CLONE_NEWPID)` does not
-move the calling process into the new namespace.** The parent keeps its old PID.
-What the flag actually does is arrange for the *next* process forked from this one
-to be PID 1 of the new namespace. The kernel works this way because a process's
-PID is visible to and cached by everything around it; silently renumbering a
-running process would break it. A namespace's init has to be *born* into it.
-
-That half of it is a happy accident for CCRun. The very next fork is the `__child`
-that `ReExec` launches, which then `execvp`s the user's command. So the user's
-command *is* PID 1 of the container, with no extra work — exactly what we want
-before mounting a private `/proc`.
-
-The other half of it is a trap, and it is the subject of the next section.
-
-If `unshare` fails with `EPERM`, CCRun prints a hint telling the user to re-run
-under sudo. This is the common case for anyone who forgets, and a helpful message
-beats a bare "operation not permitted." Root is required because creating a
-namespace needs `CAP_SYS_ADMIN`, and that changes in Phase 5 with rootless mode.
-
-### The line just above the unshare
-
-There is one more call in `RunCommand` that looks like dead code and is load-bearing:
+Third, it hands the flags and the options to `ReExec`, which does the actual work:
 
 ```csharp
-if (rootfs is not null)
-{
-    ...
-    WarmUpProcessSubsystem();
-}
-```
-
-It starts a process at a path that deliberately does not exist, and throws the
-resulting exception away. Deleting it makes `ccrun run --rootfs ...` abort every
-time with `Win32Exception (22): Invalid argument`.
-
-The reason is a rule in `clone(2)` that is easy to miss:
-
-> **EINVAL**: CLONE_THREAD was specified, but the current process previously called
-> unshare(2) with the CLONE_NEWPID flag.
-
-Read that carefully, because it is stronger than it first looks. Threads are
-created with `CLONE_THREAD`. So **once a process calls
-`unshare(CLONE_NEWPID)`, it can never create another thread for as long as it
-lives.** The kernel enforces this because every thread in a thread group must share
-one PID namespace, and the unshare has just pointed this process's *children* at a
-different namespace than the one it is in itself — so a new thread would have no
-consistent namespace to belong to. Creating a *process* stays perfectly legal,
-which is the only reason the re-exec works at all.
-
-Now recall that the .NET runtime does almost everything lazily. `Process.Start`
-needs a SIGCHLD-handling thread to reap children, and it creates that thread on the
-*first* call, inside `Process.EnsureInitialized`. Our first call is the re-exec —
-which happens after the unshare. The runtime tries to create its thread, the kernel
-says EINVAL, and the whole process aborts before the container ever starts.
-
-So the fix is to move that one-time initialization to before the unshare, while
-thread creation is still legal. `Process.Start` runs the initialization before it
-tries to exec, so a start that is guaranteed to fail warms the runtime without
-spawning a stray process or depending on some binary existing on the host.
-
-The corollary is the part worth internalizing: between the unshare and the
-`Process.Start` in `ReExec`, **no code may trigger lazy runtime initialization that
-needs a thread.** Console is the trap waiting for the next person — it shares that
-same signal-handling thread, so a single stray `Console.WriteLine` on that path
-aborts just as hard as `Process.Start` did. This is the sort of constraint that is
-invisible in the source and obvious in a stack trace, which is exactly why it is
-written down here and in a comment at the call site.
-
-An important subtlety: at this point only the parent is in the new UTS and mount
-namespaces (and, as just discussed, not in the PID namespace at all). The parent
-does not set the hostname or mount anything itself. It defers all of that to the
-child, which will inherit the namespaces. This keeps all in-namespace setup in one
-place — and for the PID namespace, the child is the only place it *can* happen.
-
-Third, it re-executes into the child stage, passing along the resolved absolute
-rootfs:
-
-```csharp
-return ReExec.RunChild(options with { Rootfs = rootfs }, stderr);
+return ReExec.RunChild(options with { Rootfs = rootfs }, flags, stderr);
 ```
 
 The `with` expression makes a copy of the options record with the rootfs swapped
-for its absolute form. The return value of `RunChild` is the child's exit code,
-which becomes CCRun's exit code. We will see how that propagates in a moment.
+for its absolute form. The return value of `RunChild` is the container's exit code,
+which becomes CCRun's exit code.
 
-### The re-exec: launching ourselves as the child
+Note what `RunCommand` does *not* do: it never creates a namespace itself. That is
+deliberate and it is the subject of the next section.
 
-[ReExec.RunChild](../../src/CCRun/Container/ReExec.cs#L23) is the machinery that
-re-launches CCRun in its init stage. It is short but has two genuinely tricky
-parts.
+### The user namespace, and rootless containers
 
-The first is **passing data to the child.** The child is a fresh process, so it
-does not share the parent's in-memory state. CCRun passes what the child needs
-through environment variables: `CCRUN_HOSTNAME` always, and `CCRUN_ROOTFS` only
-when a rootfs was given. The presence or absence of `CCRUN_ROOTFS` is exactly how
-the child knows whether to chroot. Command-line arguments carry the command and
-its arguments; environment variables carry the container configuration. This is
-the same general approach real runtimes use to hand a config from the setup
-process to the init process.
+This is the piece that changed most in Phase 5, so it is worth taking slowly.
 
-The second tricky part is **how to re-invoke this very program.** This is
-genuinely awkward on .NET because there are two ways CCRun might be running:
+**The problem.** Everything CCRun does — creating namespaces, `chroot`, mounting
+`/proc` — needs `CAP_SYS_ADMIN` or `CAP_SYS_CHROOT`. A normal user has neither.
+Requiring `sudo` to run a container is a real limitation: it means any bug in the
+runtime is a bug running as root.
+
+**The escape hatch.** Linux allows *one* exception. Creating a **user namespace**
+requires no privileges at all, and the process that creates one receives a full set
+of capabilities *inside* it. Those capabilities are real but scoped: they let you
+create other namespaces, mount things, and chroot within your own namespace, and
+they give you no authority over anything outside it. So the trick behind every
+rootless runtime is to create a user namespace first and then do everything else
+with the capabilities it hands you.
+
+**The ID map.** A new user namespace also needs to be told how IDs inside it
+correspond to IDs outside. That is the *map*, written to
+`/proc/<pid>/uid_map` and `/proc/<pid>/gid_map` as lines of
+
+```
+<first ID inside the namespace> <first ID outside it> <how many IDs>
+```
+
+CCRun writes `0 1000 1` (for a user whose UID is 1000): container ID 0 — root —
+means host ID 1000, and exactly one ID is mapped. So a process in the container
+reads its own UID as 0 and behaves as root, while the kernel accounts for
+everything it does against UID 1000. Start a `sleep` in a container and `ps` on the
+host shows it owned by you. That asymmetry *is* rootless containers.
+
+Until a map is written, every ID in the namespace reads as the "overflow" ID
+(65534, `nobody`), so writing it is not optional.
+
+Two rules constrain how the map gets written, and both shape the code:
+
+- Writing a map normally requires `CAP_SETUID` in the *parent* namespace, which we
+  do not have. The exception we rely on is that a process may write a **single-ID**
+  map when that ID is its own. Mapping yourself to yourself grants no authority you
+  did not already have, so it is permitted unprivileged. (This is the same rule
+  behind `unshare --map-root-user`.) It is also why CCRun needs no `newuidmap`
+  helper — the setuid binary general-purpose runtimes use to map whole *ranges* of
+  IDs from `/etc/subuid`.
+- Before an unprivileged writer may write `gid_map`, it must write `deny` to
+  `/proc/<pid>/setgroups`, permanently disabling `setgroups(2)` in that namespace.
+  Otherwise a user could enter a namespace, drop a supplementary group, and reach a
+  file that group was being used to deny them. The order matters: `deny` is
+  rejected once `gid_map` has been written.
+
+**The .NET-specific wrinkle.** Given the above you would expect CCRun to call
+`unshare(CLONE_NEWUSER)` and write its own maps. It cannot. From
+[unshare(2)](https://man7.org/linux/man-pages/man2/unshare.2.html):
+
+> **EINVAL**: CLONE_NEWUSER was specified in flags, but the process is
+> multithreaded.
+
+The CLR is always multithreaded — the finalizer thread alone is enough — so a
+managed process can *never* unshare a user namespace. The call fails with EINVAL
+and there is no way to make it succeed. Go has the identical problem, which is why
+runc's namespace setup lives in C code that runs before the Go runtime starts.
+
+The way around it is to stop thinking of namespaces as something you *enter* and
+start thinking of them as something a process can be *born into*. The
+single-threaded restriction applies to `unshare`, which mutates an existing process.
+It does not apply to creating a **new** process with the same flags, because a new
+process starts with exactly one thread by definition. So CCRun creates all its
+namespaces at process-creation time with `clone3`, and the parent never changes its
+own namespaces at all.
+
+A side benefit: `unshare(CLONE_NEWPID)` has a famous quirk — it does not move the
+caller into the new PID namespace, it only arranges for the caller's *next* forked
+child to be PID 1. Passing `CLONE_NEWPID` to `clone3` has no such indirection. The
+cloned child simply *is* PID 1. And because that child later `execvp`s the user's
+command in place, the user's command is PID 1 — which is what we want before
+mounting a private `/proc`.
+
+The old code also carried a `WarmUpProcessSubsystem` workaround, needed because a
+process that has called `unshare(CLONE_NEWPID)` may never create a thread again
+(`clone(2)` rejects `CLONE_THREAD` for it with EINVAL), which collided with .NET
+creating threads lazily. With no `unshare` anywhere, that whole landmine is gone.
+
+### The clone: launching ourselves as the child
+
+[ReExec.RunChild](../../src/CCRun/Container/ReExec.cs#L63) creates the container.
+It has four parts.
+
+**One: staging everything the child will need.** `StageExecArguments` works out how
+to re-invoke this very program, builds the argument and environment arrays, and
+copies them into native memory. It runs *before* the clone because the cloned child
+is not allowed to allocate — more on that below.
+
+Re-invoking ourselves is genuinely awkward on .NET, because there are two ways
+CCRun might be running:
 
 - As a **published, self-contained binary** (an "apphost"), where
-  `Environment.ProcessPath` points at the CCRun executable itself. In that case
-  you re-run that path directly.
-- Under the **`dotnet` muxer** during development (`dotnet run` or running the
-  built DLL), where `Environment.ProcessPath` points at `dotnet`, not at CCRun.
-  Running `dotnet __child ...` would tell the .NET launcher to look for a command
-  called `__child`, which is nonsense. You have to run `dotnet path/to/CCRun.dll
-  __child ...` instead.
-
-The code handles both:
+  `Environment.ProcessPath` points at the CCRun executable itself. In that case you
+  re-run that path directly.
+- Under the **`dotnet` muxer** during development (`dotnet run` or running the built
+  DLL), where `Environment.ProcessPath` points at `dotnet`, not at CCRun. Running
+  `dotnet __child ...` would tell the .NET launcher to look for a command called
+  `__child`, which is nonsense. You have to run `dotnet path/to/CCRun.dll __child
+  ...` instead.
 
 ```csharp
-string exe = Environment.ProcessPath ?? throw ...;
-psi.FileName = exe;
+var argv = new List<string> { exe };
 if (Path.GetFileNameWithoutExtension(exe).Equals("dotnet", StringComparison.OrdinalIgnoreCase))
-{
-    string dll = Assembly.GetEntryAssembly()?.Location ...;
-    psi.ArgumentList.Add(dll);
-}
+    argv.Add(dll);
+argv.Add(ChildVerb);
 ```
 
-If the process we are running as is `dotnet`, we prepend the entry assembly's DLL
-path so the muxer knows which managed program to launch. Otherwise we invoke the
-apphost directly. Then it appends the `__child` verb, the command, and its
-arguments.
+Configuration reaches the child through the environment: `CCRUN_HOSTNAME` always,
+`CCRUN_ROOTFS` only when a rootfs was given. The presence or absence of
+`CCRUN_ROOTFS` is exactly how the child knows whether to chroot. Command-line
+arguments carry the command; environment variables carry the container config —
+the same split real runtimes use.
 
-Finally it starts the child and waits:
+**Two: the clone itself.** `clone3` has no glibc wrapper, so CCRun calls it through
+the raw `syscall(2)` escape hatch, passing a `struct clone_args` in which only two
+fields are non-zero: the namespace flags, and `exit_signal = SIGCHLD` (which is
+what makes the child waitable with `waitpid`). Leaving `stack` zero gives fork-like
+behaviour — the child gets its own copy of our address space rather than sharing
+it.
 
 ```csharp
-using var child = Process.Start(psi) ?? throw ...;
-child.WaitForExit();
-return child.ExitCode;
+long ret = Libc.Syscall(Libc.SYS_clone3, args, Libc.CLONE_ARGS_SIZE_VER0);
 ```
 
-`UseShellExecute = false` with no stream redirection means the child inherits the
-parent's standard input, output, and error. That is what lets an interactive
-shell work across the re-exec hop: keystrokes and output flow straight through.
-And returning `child.ExitCode` is the mechanism by which the user command's exit
-code climbs back out to CCRun's own exit code. The command exits with 3, the
-child stage exits with 3, `RunChild` returns 3, `RunCommand` returns 3, and CCRun
-exits 3. A caller's `echo $?` sees the real answer.
+`clone3` is syscall number 435 on every architecture, unlike the older `clone`,
+whose number *and argument order* vary between x86-64 and arm64. That is worth a
+line of explanation because it is the reason CCRun targets `clone3` (Linux 5.3+)
+rather than the more widely available `clone`: it keeps the arm64 cross-compilation
+story trivial.
+
+Like `fork`, `clone3` returns twice — the child pid in the parent, and 0 in the
+child.
+
+**Three: the handshake.** The child must not `execve` until its ID maps exist, and
+it cannot write them itself. Why not is subtle: `execve` *clears* a process's
+permitted capability set unless it is running as root or the binary carries file
+capabilities. Right after the clone, the child is the unmapped overflow UID — not
+root — so if it exec'd first it would land in the init stage with its
+`CAP_SYS_ADMIN` stripped, and the chroot and mount would fail. Written maps make it
+root-in-namespace, and a root-in-namespace `execve` keeps its capabilities.
+
+So the two processes rendezvous over a pipe:
+
+```
+child:   read(pipe)  ──blocks──────────────┐
+parent:  write /proc/<pid>/setgroups        │
+         write /proc/<pid>/uid_map          │
+         write /proc/<pid>/gid_map          │
+         write(pipe) ───────────────────────┘ unblocks the child
+child:   execve(ccrun __child ...)
+```
+
+The parent can write the child's maps because of the single-ID rule above: it is
+mapping *its own* effective UID. The `finally` block closes the write end even when
+the map writes fail, so an error surfaces as the child exiting rather than as a
+hang.
+
+**Four: reaping.** `waitpid` blocks until the container finishes and yields a *wait
+status*, which is not the exit code but a packed integer. The `W*` accessors in C
+are macros, so there is nothing to P/Invoke and CCRun unpacks it by hand: low seven
+bits zero means a normal exit with the code in the next eight bits; otherwise the
+process was killed by the signal in those low bits, reported as `128 + signal` the
+way a shell does.
+
+This is how the user command's exit code climbs back out: the command exits 3, the
+init stage exits 3, `waitpid` reports 3, `RunChild` returns 3, and CCRun exits 3. A
+caller's `echo $?` sees the real answer. Because the clone shares the parent's file
+descriptors and CCRun redirects nothing, the container inherits stdin, stdout and
+stderr directly — which is what lets an interactive shell work across the hop.
+
+#### The rule for code in the cloned child
+
+`RunAsClonedChild` looks like ordinary C#, and it is the most constrained code in
+the repository. Everything it may do is: block on a pipe, close two descriptors,
+`execve`.
+
+The reason is what `clone` does to a multithreaded process. The child gets a copy
+of the parent's memory but only *one* thread — the one that called clone. Every
+lock another thread happened to hold at that instant is copied in its locked state,
+and there is no longer a thread alive that could release it. If the child then
+touches anything that takes a runtime lock — allocating, JIT-compiling a method,
+initializing `Console` — it deadlocks, silently and permanently.
+
+So the child path calls nothing but libc through pointers computed before the
+clone, and `PrepareClonedChildPath` removes the remaining risk by forcing the
+method to be JIT-compiled and its interop stubs resolved while we are still safely
+in the parent:
+
+```csharp
+RuntimeHelpers.PrepareMethod(...RunAsClonedChild...MethodHandle);
+Libc.Close(-1);                // EBADF — harmless, but resolves the stub
+Libc.Read(-1, IntPtr.Zero, 0); // EBADF
+Libc.Execve(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); // EFAULT
+```
+
+Those three calls all fail on purpose. Their only job is to make the runtime do its
+lazy interop setup at a moment when doing so is safe. Anything added to
+`RunAsClonedChild` later must obey the same rules, or the failure will be a hang
+with no stack trace.
 
 ### The child stage: hostname, chroot, /proc, hand-off
 
-[ChildCommand.Execute](../../src/CCRun/Commands/ChildCommand.cs#L20) is the init stage,
+[ChildCommand.Execute](../../src/CCRun/Commands/ChildCommand.cs#L22) is the init stage,
 now running inside the namespaces the parent created — and, on the rootfs path, as
 PID 1 of the new PID namespace. This is where the container is actually assembled.
 
@@ -419,7 +497,7 @@ directory outside its new root, and it can walk upward from there with `..` and
 escape the jail entirely. Calling `chdir("/")` right after the chroot moves the
 working directory to the new root, so there is no dangling handle to climb. This
 is exactly what the integration test
-[Chroot_CannotEscapeAboveRoot](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L101)
+[Chroot_CannotEscapeAboveRoot](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L100)
 verifies: from inside the container, `cd ..` at `/` stays at `/`.
 
 It is worth being honest about what chroot does *not* do, because this is where
@@ -428,8 +506,8 @@ give the process a private mount table, does not hide the host's processes, does
 not isolate the network, and does not stop a sufficiently privileged process from
 breaking out through other means. On its own it is a filesystem view, not a
 security boundary. Phase 4 layers the mount and PID namespaces on top, which is
-the subject of the next section; dropped capabilities and a user namespace come
-later still.
+the subject of the next section, and Phase 5 adds the user namespace; dropping
+capabilities inside the container comes later still.
 
 One thing Phase 4 deliberately did *not* do is replace `chroot` with
 [pivot_root(2)](https://man7.org/linux/man-pages/man2/pivot_root.2.html). Real
@@ -439,8 +517,8 @@ file descriptor pointing outside a chroot can walk out through it, and `pivot_ro
 removes that possibility. CCRun keeps the plain `chroot` for now because the
 Phase 4 requirements are about process isolation, and mixing a second filesystem
 change into the same phase would blur what each primitive contributes. It is
-revisited with the user-namespace work, where the stronger boundary starts to
-matter.
+still on the list — Phase 5 kept the plain `chroot` too, since the user-namespace
+work did not need the stronger boundary either.
 
 ## PID namespace, mount namespace, and a private `/proc`
 
@@ -514,7 +592,7 @@ it, and returns its exit code. Simple and safe.
 
 On the chroot path, CCRun instead calls
 [execvp(2)](https://man7.org/linux/man-pages/man2/execvp.2.html) through
-[ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L115), which *replaces* the
+[ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L118), which *replaces* the
 current process image with the command. After a successful `execvp`, there is no
 more .NET code running at all; the process has become BusyBox (or whatever the
 command is). `execvp` only returns if the exec fails.
@@ -560,12 +638,14 @@ piece of interop, covered next.
 [Native/Libc.cs](../../src/CCRun/Native/Libc.cs) is the whole native surface of the
 project. It uses .NET's source-generated P/Invoke, the `[LibraryImport]`
 attribute, which generates the marshalling code at compile time rather than at
-runtime. Every function CCRun needs from libc is declared here: `unshare`,
-`sethostname`, `chroot`, `chdir`, `mount`, `execvp`, and `geteuid`. That is the
-entire native surface of a container runtime's core, which is a fair summary of
-this project's thesis.
+runtime. Every function CCRun needs from libc is declared here: `syscall` (used
+only to reach `clone3`, which glibc exposes no wrapper for), `sethostname`,
+`chroot`, `chdir`, `mount`, `execve` and `execvp`, the `pipe`/`read`/`write`/`close`
+handshake calls, `waitpid`, `_exit`, and `geteuid`/`getegid`. That is the entire
+native surface of a container runtime's core, which is a fair summary of this
+project's thesis.
 
-Two conventions run through the file.
+Three conventions run through the file.
 
 **Errno reporting.** Every call that can fail is declared with
 `SetLastError = true`, and there is a helper:
@@ -597,7 +677,7 @@ nothing loaded, so it survives the chroot.
 
 **The NULL-terminated argv trick.** `execvp` expects a C array of string
 pointers terminated by a null pointer, with `argv[0]` conventionally the program
-name. [ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L115) builds this by
+name. [ChildCommand.Exec](../../src/CCRun/Commands/ChildCommand.cs#L118) builds this by
 allocating one extra slot and leaving it null:
 
 ```csharp
@@ -616,6 +696,14 @@ The same null-marshalling behavior is why `Mount` can declare `source`,
 `filesystemtype`, and `data` as nullable strings and pass C# `null` straight
 through as a NULL pointer — which several of `mount`'s modes, like the propagation
 change above, genuinely require.
+
+**Pointers where the marshaller would be unsafe.** `Execve` is the odd one out: it
+takes three raw `IntPtr`s rather than the friendly string types `Execvp` uses. That
+is deliberate. It is called from the cloned child, where allocating is forbidden,
+and string marshalling allocates. So `ReExec` builds the `char*[]` arrays itself
+with `Marshal.StringToHGlobalAnsi` *before* the clone, and the child passes along
+pointers that already exist. Where a signature looks needlessly low-level in this
+file, that is usually the reason.
 
 ## Exit codes
 
@@ -655,37 +743,40 @@ The pure, always-run tests cover the parts that touch no privileged syscalls:
   child-process exit-code contract on the non-chroot path, which is exactly why
   that path was kept on `Process.Start`.
 - [RunCommandTests](../../tests/CCRun.Tests/RunCommandTests.cs) covers parent-stage
-  behavior that fails *before* `unshare`, including the missing-rootfs error and
-  the non-root sudo hint. The missing-rootfs test is reachable without root
-  precisely because validation runs before any namespace work.
+  behavior that returns *before* any namespace is created — argument errors and the
+  missing-rootfs error — and hosts the `IsRoot` / `IsUserNsAvailable` gates the
+  integration tests share. These are reachable with no privileges precisely because
+  validation runs before any namespace work.
 
 The tests that genuinely need privileges live in
 [NamespaceIntegrationTests](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs) and
-use `Xunit.SkippableFact`. They call `Skip.IfNot(RunCommandTests.IsRoot, ...)`,
-so on an ordinary unprivileged machine or CI run they skip cleanly and
-`dotnet test` stays green. Run them with `sudo dotnet test` to exercise the full
-pipeline: unshare, re-exec, sethostname, chroot, the `/proc` mount, and the
-`execvp` hand-off into an in-rootfs BusyBox.
+use `Xunit.SkippableFact`. Before Phase 5 they were gated on being root and
+skipped on a normal `dotnet test`; now that ccrun makes its own user namespace they
+are gated on `RunCommandTests.IsUserNsAvailable` — root *or* a kernel that permits
+unprivileged user namespaces — so a plain `dotnet test` exercises the whole
+pipeline: clone3, the ID maps, sethostname, chroot, the `/proc` mount, and the
+`execvp` hand-off into an in-rootfs BusyBox. They skip only where user namespaces
+are switched off, which the gate detects by reading the two sysctl knobs
+(`kernel.unprivileged_userns_clone` and `user/max_user_namespaces`).
 
-They also do not need sudo, which is worth knowing while developing them. An
-unprivileged user namespace hands you `CAP_SYS_ADMIN` and `CAP_SYS_CHROOT` *inside*
-it, which is exactly what ccrun wants, so the whole suite runs unprivileged with:
-
-```sh
-unshare --user --map-root-user dotnet test
-```
+Two of them exist specifically to pin down FR-5.2 and FR-5.3, the rootless
+requirements. `Rootless_ContainerRootMapsToInvokingUser` runs `id -u` in the
+container and asserts `0` — which also proves the map was actually applied, since an
+unmapped namespace would report the overflow ID 65534 instead.
+`Rootless_HostSeesProcessOwnedByInvokingUser` is the interesting half: it starts a
+`sleep` with a distinctive duration, finds that process in the *host's* `/proc` by
+scanning command lines, reads the effective UID out of `/proc/<pid>/status`, and
+asserts it equals the test runner's own UID and is not 0. That is the whole point of
+rootless containers expressed as an assertion — root inside, you outside. It skips
+when running as root, where container root maps to real root and the check would be
+vacuous.
 
 Unlike every other test class, these spawn the ccrun **binary** rather than calling
 `Cli.Run` in-process, and that is a hard requirement rather than a style choice.
-`run` calls `unshare(2)`, which permanently mutates the calling process — and
-in-process, the calling process is the xunit test host. A stray UTS namespace is
-survivable. A PID namespace is not: per the rule above the test host could no
-longer create threads, and worse, once the container's PID 1 exits, the namespace
-has no init, so every subsequent `fork(2)` from that process fails with `ENOMEM`.
-A single in-process rootfs test would wedge the host and take down every test that
-ran after it, producing a cascade of failures with nothing to do with the code
-under test. Spawning a fresh process per run confines each test's namespace damage
-to itself.
+`run` clones a child into new namespaces and reaps it with `waitpid`; done
+in-process, that child and its wait status would be grafted onto the xunit test
+host, which is also busy managing its own processes. Spawning a fresh ccrun per test
+keeps each container's process tree, PID namespace and exit plumbing to itself.
 
 The out-of-process design pays a bonus: stdout is a real inherited file
 descriptor, so these tests can assert on what the container actually printed, even
@@ -704,7 +795,7 @@ the test polls for the marker, reads `/proc/self/mounts` on the host while the
 container is definitely live, and kills it in a `finally`.
 
 The chroot tests have a second gate. They call a small helper,
-[FindAlpineRootfs](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L74), that walks
+[FindAlpineRootfs](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L73), that walks
 up from the test binary's directory looking for `alpine-rootfs/ALPINE_FS_ROOT`
 and a real `bin/busybox`. If the Alpine rootfs is not present on the machine,
 those tests skip too, rather than failing. The rootfs is git-ignored, so this
@@ -722,16 +813,26 @@ because the later phases *require* setup to happen in a freshly namespaced child
 and Phase 2 paid that cost up front so the rest could slot in. Phase 4 mostly bore
 that out: the PID and mount namespaces and the private `/proc` slotted into the
 existing two stages without new structure, because the fork ordering and the
-`execvp` hand-off were already what a proper PID 1 needs. What it did *not*
-anticipate was how much the .NET runtime's laziness would fight a process that has
-unshared a PID namespace or chroot'd away from its own assemblies — hence the two
-warm-ups and the move off `Win32Exception`. The architecture held; the runtime
-underneath it needed coaxing. Here is the rest of the trajectory:
+`execvp` hand-off were already what a proper PID 1 needs.
 
-- **Phase 5** adds cgroup v2 for CPU and memory limits, and rootless mode, which
-  uses a user namespace to obtain the capabilities that today force `sudo`. This
-  is also where `pivot_root` gets revisited, replacing the plain `chroot` for a
-  stronger filesystem boundary.
+Phase 5 tested the architecture harder. The *shape* survived — still two stages,
+still a hidden `__child` verb, still the same env-var handoff — but the mechanism
+underneath the parent stage had to be replaced wholesale, because a multithreaded
+.NET process simply cannot `unshare` a user namespace. Swapping `unshare` +
+`Process.Start` for `clone3` + `waitpid` touched only `ReExec`, which is a fair
+verdict on the original boundaries. The recurring theme across both phases is that
+the .NET runtime's laziness fights low-level process work: the warm-ups, the move
+off `Win32Exception`, and now the pre-JIT of the cloned child's code path all exist
+for that reason.
+
+Here is the rest of the trajectory:
+
+- **Phase 6** adds cgroup v2 for CPU and memory limits — writing to the unified
+  `/sys/fs/cgroup` hierarchy to cap what the container may consume. Note that
+  rootless cgroup control needs either a delegated cgroup subtree or systemd's
+  help, so this phase interacts with Phase 5 more than it first appears.
+- `pivot_root` remains deferred, and is the natural companion to whichever phase
+  next needs a stronger filesystem boundary than `chroot` provides.
 - **Phases 7 and 8** add image handling: pulling from a registry and unpacking
   layers into the rootfs that `--rootfs` points at today.
 

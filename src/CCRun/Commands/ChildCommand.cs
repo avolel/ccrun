@@ -11,8 +11,10 @@ namespace ccrun;
 /// the rootfs (FR-3.1) and mounts a private /proc (FR-4.2) before handing off to
 /// the user command.
 ///
-/// On the rootfs path this process is PID 1 of a new PID namespace (FR-4.1): the
-/// parent's unshare(CLONE_NEWPID) took effect on the fork that produced us.
+/// On the rootfs path this process is PID 1 of a new PID namespace (FR-4.1): the parent
+/// passed CLONE_NEWPID when it cloned us, so we were born as the namespace's init. It also
+/// passed CLONE_NEWUSER and mapped us to root inside it, which is where the capabilities
+/// the steps below need come from — no real root involved (FR-5.1).
 /// </summary>
 public static class ChildCommand
 {
