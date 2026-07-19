@@ -111,12 +111,17 @@ internal static partial class Libc
     [LibraryImport("libc", EntryPoint = "syscall", SetLastError = true)]
     internal static partial long Syscall(long number, IntPtr arg1, nuint arg2);
 
-    /// <summary>pipe(2): fds[0] is the read end, fds[1] the write end.</summary>
-    [LibraryImport("libc", EntryPoint = "pipe", SetLastError = true)]
-    internal static partial int Pipe([Out] int[] fds);
+    /// <summary>open(2)/pipe2(2) flag: close this descriptor automatically on exec.</summary>
+    public const int O_CLOEXEC = 0x80000;
 
-    [LibraryImport("libc", EntryPoint = "read", SetLastError = true)]
-    internal static partial nint Read(int fd, IntPtr buf, nuint count);
+    /// <summary>
+    /// pipe2(2): fds[0] is the read end, fds[1] the write end. Preferred over pipe(2)
+    /// because it can set O_CLOEXEC atomically, which saves the cloned child from having
+    /// to close anything by hand — see <see cref="ReExec"/> on why its code must stay
+    /// minimal.
+    /// </summary>
+    [LibraryImport("libc", EntryPoint = "pipe2", SetLastError = true)]
+    internal static partial int Pipe2([Out] int[] fds, int flags);
 
     [LibraryImport("libc", EntryPoint = "write", SetLastError = true)]
     internal static partial nint Write(int fd, IntPtr buf, nuint count);
@@ -124,12 +129,31 @@ internal static partial class Libc
     [LibraryImport("libc", EntryPoint = "close", SetLastError = true)]
     internal static partial int Close(int fd);
 
+    // The three imports below are the *only* calls the cloned child makes, and they carry
+    // [SuppressGCTransition] for that reason. Normally a P/Invoke brackets the native call
+    // with a transition that moves the thread out of and back into cooperative GC mode,
+    // touching runtime state the child is in no position to touch: it holds one thread out
+    // of a multithreaded CLR, so if a garbage collection was being coordinated at the
+    // moment of the clone, the child inherits a suspension that can never be resolved,
+    // because the threads that would resolve it do not exist in it. The runtime detects the
+    // impossible state and calls abort(). Suppressing the transition makes these compile to
+    // bare native calls that touch no runtime state at all, which is what a post-clone
+    // child needs. The usual caveat for the attribute — the callee must be short and must
+    // not block — is knowingly waived for Read: it blocks by design, and it is safe here
+    // precisely because the child is single-threaded and no GC can be pending on it.
+
+    /// <summary>read(2). Child-path only; see the note above on [SuppressGCTransition].</summary>
+    [LibraryImport("libc", EntryPoint = "read", SetLastError = true)]
+    [SuppressGCTransition]
+    internal static partial nint Read(int fd, IntPtr buf, nuint count);
+
     /// <summary>
     /// execve(2) taking already-marshalled native pointers. The pointer-based signature is
     /// deliberate: this runs in a freshly cloned child where allocating (which string
     /// marshalling would do) is unsafe — see <see cref="ReExec"/>.
     /// </summary>
     [LibraryImport("libc", EntryPoint = "execve", SetLastError = true)]
+    [SuppressGCTransition]
     internal static partial int Execve(IntPtr path, IntPtr argv, IntPtr envp);
 
     /// <summary>
@@ -138,6 +162,7 @@ internal static partial class Libc
     /// runtime's shutdown path.
     /// </summary>
     [LibraryImport("libc", EntryPoint = "_exit")]
+    [SuppressGCTransition]
     internal static partial void Exit(int status);
 
     [LibraryImport("libc", EntryPoint = "waitpid", SetLastError = true)]

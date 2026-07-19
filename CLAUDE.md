@@ -60,12 +60,16 @@ that will hang or abort the runtime if disturbed:
   and error paths alike. Explicit unmounting would be impossible after `execvp`
   replaces the process image anyway.
 - **The cloned child may not touch the managed runtime.** It is cloned out of a
-  multithreaded CLR, so it has one thread and any runtime lock another thread held
-  at clone time is now locked forever; allocating, JITting, or writing to `Console`
-  there can deadlock. `ReExec.RunAsClonedChild` is restricted to direct libc calls
-  on pointers staged *before* the clone, and `PrepareClonedChildPath` pre-compiles
-  it and pre-resolves its interop stubs. Anything added to that method must keep
-  those rules.
+  multithreaded CLR, so it has one thread and any runtime state another thread was
+  mid-way through mutating is frozen with nobody to finish it; allocating, JITting,
+  or writing to `Console` there can deadlock. **Even a normal P/Invoke is unsafe**:
+  its GC transition can observe a suspension that can never complete, and the
+  runtime answers that with `abort()` — an intermittent, load-dependent crash that
+  surfaces as the container dying of a signal. So `ReExec.RunAsClonedChild` is
+  limited to two libc calls on pointers staged *before* the clone, both imports
+  carry `[SuppressGCTransition]`, `PrepareClonedChildPath` pre-compiles the method
+  and pre-resolves its stubs, and the pipe is `O_CLOEXEC` so no `close` is needed.
+  Anything added to that method must keep all of those rules.
 - **The UID/GID maps must be written by the parent, before the child execs.** A new
   user namespace starts with empty maps, in which every id is the overflow uid
   (nobody), and `execve` clears the permitted capability set for a non-root uid with

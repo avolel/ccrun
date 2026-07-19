@@ -420,22 +420,43 @@ and there is no longer a thread alive that could release it. If the child then
 touches anything that takes a runtime lock — allocating, JIT-compiling a method,
 initializing `Console` — it deadlocks, silently and permanently.
 
-So the child path calls nothing but libc through pointers computed before the
-clone, and `PrepareClonedChildPath` removes the remaining risk by forcing the
-method to be JIT-compiled and its interop stubs resolved while we are still safely
-in the parent:
+There is a subtler version of the same hazard that is worth spelling out, because it
+is invisible in the source. An ordinary P/Invoke does not just call the native
+function: it brackets the call with a *GC transition*, moving the thread out of and
+back into cooperative garbage-collection mode. That bookkeeping touches shared
+runtime state. If a collection was being coordinated at the instant of the clone,
+the child inherits a half-finished suspension that can never complete — the threads
+that would complete it do not exist in it — and the runtime responds to the
+impossible state by calling `abort()`. It is rare, timing-dependent, and shows up as
+the container dying of a signal rather than exiting.
+
+The defence is three-layered:
 
 ```csharp
-RuntimeHelpers.PrepareMethod(...RunAsClonedChild...MethodHandle);
-Libc.Close(-1);                // EBADF — harmless, but resolves the stub
-Libc.Read(-1, IntPtr.Zero, 0); // EBADF
-Libc.Execve(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); // EFAULT
+[LibraryImport("libc", EntryPoint = "read", SetLastError = true)]
+[SuppressGCTransition]                       // no GC bookkeeping around the call
+internal static partial nint Read(int fd, IntPtr buf, nuint count);
 ```
 
-Those three calls all fail on purpose. Their only job is to make the runtime do its
-lazy interop setup at a moment when doing so is safe. Anything added to
-`RunAsClonedChild` later must obey the same rules, or the failure will be a hang
-with no stack trace.
+```csharp
+RuntimeHelpers.PrepareMethod(...RunAsClonedChild...MethodHandle);  // no JIT in the child
+Libc.Read(-1, IntPtr.Zero, 0);                      // EBADF — resolves the stub
+Libc.Execve(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); // EFAULT — ditto
+```
+
+`[SuppressGCTransition]` turns those imports into bare native calls that touch no
+runtime state; `PrepareMethod` compiles the method in advance; and the two
+deliberately-failing calls make the runtime do its lazy interop setup at a moment
+when doing so is safe. The attribute normally comes with a rule that the callee must
+be brief and must not block, which `read` plainly violates — that is knowingly
+waived here, and it is sound for the same reason the rest of this works: the child
+has one thread, so there is no collection for a blocked call to obstruct.
+
+The child's budget is down to two calls, `read` and `execve`, which is why the pipe
+is created with `O_CLOEXEC` — the descriptors close themselves during the exec, so
+the child needs no `close`. Anything added to `RunAsClonedChild` later must obey the
+same rules, or the failure will be an intermittent hang or abort with no usable
+stack trace.
 
 ### The child stage: hostname, chroot, /proc, hand-off
 

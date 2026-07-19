@@ -64,10 +64,12 @@ internal static class ReExec
     {
         StageExecArguments(options);
 
+        // O_CLOEXEC means both ends vanish by themselves when the child execs, so the child
+        // never has to close anything — one less call on a code path that must stay minimal.
         var fds = new int[2];
-        if (Libc.Pipe(fds) != 0)
+        if (Libc.Pipe2(fds, Libc.O_CLOEXEC) != 0)
         {
-            stderr.WriteLine($"ccrun: pipe failed: {Libc.LastErrorMessage()}");
+            stderr.WriteLine($"ccrun: pipe2 failed: {Libc.LastErrorMessage()}");
             return ExitCodes.RuntimeError;
         }
         s_childReadFd = fds[0];
@@ -77,16 +79,18 @@ internal static class ReExec
 
         int pid = Clone(namespaceFlags, stderr);
         if (pid < 0)
+        {
+            Libc.Close(s_childReadFd);
+            Libc.Close(s_childWriteFd);
             return ExitCodes.RuntimeError;
+        }
         if (pid == 0)
             RunAsClonedChild(); // never returns
 
         Libc.Close(s_childReadFd);
-        try
+        bool mapped = WriteIdMaps(pid, stderr);
+        if (mapped)
         {
-            if (!WriteIdMaps(pid, stderr))
-                return ExitCodes.RuntimeError;
-
             // Any byte will do; the child only cares that the read completes.
             unsafe
             {
@@ -94,14 +98,15 @@ internal static class ReExec
                 Libc.Write(s_childWriteFd, (IntPtr)(&go), 1);
             }
         }
-        finally
-        {
-            // Closing unblocks the child even if we failed above, so a map error surfaces
-            // as the child exiting rather than as a hang.
-            Libc.Close(s_childWriteFd);
-        }
 
-        return WaitForExitCode(pid, stderr);
+        // Closing unblocks the child even when the maps failed, so that case surfaces as
+        // the child exiting rather than as a hang.
+        Libc.Close(s_childWriteFd);
+
+        // Reap unconditionally. Even on the failure path the child exists and must be
+        // waited for, or we would exit leaving a zombie behind.
+        int code = WaitForExitCode(pid, stderr);
+        return mapped ? code : ExitCodes.RuntimeError;
     }
 
     /// <summary>
@@ -147,24 +152,30 @@ internal static class ReExec
     /// </summary>
     /// <remarks>
     /// This runs in a process cloned out of a multithreaded CLR, so only the cloning thread
-    /// exists here and any runtime lock another thread held at clone time is now
-    /// permanently locked. Touching the allocator, the JIT, or Console could therefore
-    /// deadlock. The rule for this method is: no allocation, no managed I/O, nothing but
-    /// direct libc calls on pointers staged before the clone — and every method it reaches
-    /// is compiled ahead of time by PrepareClonedChildPath.
+    /// exists here and any runtime state another thread was mutating at clone time is
+    /// frozen mid-flight with nobody left to finish it. Touching the allocator, the JIT,
+    /// Console — or even doing a normal P/Invoke GC transition — can therefore deadlock or
+    /// trip a runtime assertion that ends in abort(). The rules for this method are:
+    ///
+    /// <list type="bullet">
+    /// <item>no allocation and no managed I/O;</item>
+    /// <item>nothing but libc calls on pointers staged before the clone;</item>
+    /// <item>every one of those imports carries [SuppressGCTransition], so the calls touch
+    /// no runtime state at all;</item>
+    /// <item>everything it reaches is compiled in advance by PrepareClonedChildPath.</item>
+    /// </list>
+    ///
+    /// Two calls is the whole budget. The pipe's descriptors are O_CLOEXEC, so the exec
+    /// cleans them up and no close is needed here.
     /// </remarks>
     private static void RunAsClonedChild()
     {
         unsafe
         {
             byte go = 0;
-            nint n = Libc.Read(s_childReadFd, (IntPtr)(&go), 1);
-            if (n != 1)
+            if (Libc.Read(s_childReadFd, (IntPtr)(&go), 1) != 1)
                 Libc.Exit(ExitCodes.RuntimeError); // parent died or failed to write the maps
         }
-
-        Libc.Close(s_childReadFd);
-        Libc.Close(s_childWriteFd);
 
         // Replaces this process image; we are mapped as root in the new user namespace, so
         // the capabilities the init stage needs survive the exec.
@@ -184,8 +195,7 @@ internal static class ReExec
             typeof(ReExec).GetMethod(nameof(RunAsClonedChild), BindingFlags.NonPublic | BindingFlags.Static)!
                 .MethodHandle);
 
-        Libc.Close(-1);                              // EBADF
-        Libc.Read(-1, IntPtr.Zero, 0);               // EBADF
+        Libc.Read(-1, IntPtr.Zero, 0);                      // EBADF
         Libc.Execve(IntPtr.Zero, IntPtr.Zero, IntPtr.Zero); // EFAULT
     }
 
