@@ -1,4 +1,3 @@
-using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -39,15 +38,17 @@ public static class ChildCommand
         string? rootfs = Environment.GetEnvironmentVariable(ReExec.RootfsEnv);
         if (rootfs is not null)
         {
-            // Everything below runs after chroot, where the .NET runtime's own assemblies
-            // sit outside the new root and can no longer be loaded on demand. Console
-            // initializes itself lazily on its first real write, pulling in
-            // Microsoft.Win32.Primitives — so a failure message from any step below would
-            // try to load it from an unreachable path and die with a FileNotFoundException,
-            // losing the diagnostic and the exit code both. Get that assembly resident now,
-            // while the runtime directory is still reachable. (Libc.LastErrorMessage dodges
-            // the same trap by using strerror instead of Win32Exception; see Libc.)
-            PreloadConsoleWriteDependencies();
+            // Every failure message below goes out through WriteStderrLine (a raw write(2))
+            // rather than the injected TextWriter. Once we chroot, the runtime's own
+            // assemblies sit outside the new root and can no longer be loaded on demand —
+            // and Console's first real write lazily initializes its terminal support,
+            // which pulls in several assemblies (System.Collections, Microsoft.Win32.
+            // Primitives, ...). Any of those would fail to load here and kill the process
+            // with a FileNotFoundException, losing both the diagnostic and the exit code.
+            // Pre-loading them one by one is a losing game against an implementation
+            // detail, so the post-chroot paths simply do not use Console at all.
+            // (Libc.LastErrorMessage dodges the same trap by using strerror instead of
+            // Win32Exception; see Libc.)
 
             // We are PID 1 of a fresh PID namespace, inside a fresh mount namespace.
             // Before touching any mount, mark the inherited tree private so nothing we
@@ -59,7 +60,7 @@ public static class ChildCommand
             // so the recursion covers the whole tree.
             if (Libc.Mount("none", "/", null, Libc.MS_REC | Libc.MS_PRIVATE, null) != 0)
             {
-                stderr.WriteLine($"ccrun: cannot make mounts private: {Libc.LastErrorMessage()}");
+                WriteStderrLine($"ccrun: cannot make mounts private: {Libc.LastErrorMessage()}");
                 return ExitCodes.RuntimeError;
             }
 
@@ -68,12 +69,12 @@ public static class ChildCommand
             // way to escape a chroot (FR-3.1, FR-3.2).
             if (Libc.Chroot(rootfs) != 0)
             {
-                stderr.WriteLine($"ccrun: chroot('{rootfs}') failed: {Libc.LastErrorMessage()}");
+                WriteStderrLine($"ccrun: chroot('{rootfs}') failed: {Libc.LastErrorMessage()}");
                 return ExitCodes.RuntimeError;
             }
             if (Libc.Chdir("/") != 0)
             {
-                stderr.WriteLine($"ccrun: chdir('/') failed: {Libc.LastErrorMessage()}");
+                WriteStderrLine($"ccrun: chdir('/') failed: {Libc.LastErrorMessage()}");
                 return ExitCodes.RuntimeError;
             }
 
@@ -89,7 +90,7 @@ public static class ChildCommand
             // impossible anyway once execvp replaces this process image.
             if (Libc.Mount("proc", "/proc", "proc", Libc.MS_NOSUID | Libc.MS_NODEV | Libc.MS_NOEXEC, null) != 0)
             {
-                stderr.WriteLine($"ccrun: cannot mount /proc: {Libc.LastErrorMessage()}");
+                WriteStderrLine($"ccrun: cannot mount /proc: {Libc.LastErrorMessage()}");
                 return ExitCodes.RuntimeError;
             }
 
@@ -97,25 +98,34 @@ public static class ChildCommand
             // runtime's own files may be outside the new root, so we must not do further
             // managed work (Process.Start). The command inherits our stdio and its exit
             // code becomes this stage's, which ReExec propagates up (FR-1.3, FR-1.4).
-            return Exec(args, stderr);
+            return Exec(args);
         }
 
         // No rootfs => Phase 2 behavior; Process.Start is safe without a chroot.
         return ProcessRunner.Run(args[0], args[1..], stderr);
     }
 
-    // Pre-loads the assembly that Console's first-write terminal initialization needs, by
-    // constructing a throwaway instance of a type that lives in it (Win32Exception is in
-    // Microsoft.Win32.Primitives). Triggering that initialization directly would mean
-    // actually writing bytes into the container's output, so we settle for making sure
-    // the assembly is already resident by the time the first write happens.
-    private static void PreloadConsoleWriteDependencies()
+    // Writes one line to fd 2 with a raw write(2). Used instead of Console/TextWriter on
+    // every path that can run after the chroot, where Console's lazy terminal
+    // initialization would try to load assemblies that are no longer reachable. Only
+    // CoreLib is touched here, and that is already resident.
+    private static unsafe void WriteStderrLine(string message)
     {
-        _ = new Win32Exception(0);
+        byte[] bytes = Encoding.UTF8.GetBytes(message + "\n");
+        fixed (byte* p = bytes)
+        {
+            nint written = 0;
+            while (written < bytes.Length)
+            {
+                nint n = Libc.Write(2, (IntPtr)(p + written), (nuint)(bytes.Length - written));
+                if (n <= 0) return;   // nothing useful left to do about a failing stderr
+                written += n;
+            }
+        }
     }
 
     // Hands off to the command via execvp(2); only returns if the exec fails.
-    private static int Exec(string[] argv, TextWriter stderr)
+    private static int Exec(string[] argv)
     {
         string command = argv[0];
 
@@ -128,7 +138,7 @@ public static class ChildCommand
         Libc.Execvp(command, cargv);
 
         int err = Marshal.GetLastPInvokeError();
-        stderr.WriteLine($"ccrun: cannot exec '{command}': {Libc.LastErrorMessage()}");
+        WriteStderrLine($"ccrun: cannot exec '{command}': {Libc.LastErrorMessage()}");
         // Match ProcessRunner's mapping: EACCES => not executable (126), else not found (127).
         return err == Libc.EACCES ? ExitCodes.CommandNotExecutable : ExitCodes.CommandNotFound;
     }
