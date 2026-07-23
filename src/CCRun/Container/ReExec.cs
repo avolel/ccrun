@@ -88,25 +88,48 @@ internal static class ReExec
             RunAsClonedChild(); // never returns
 
         Libc.Close(s_childReadFd);
-        bool mapped = WriteIdMaps(pid, stderr);
-        if (mapped)
+        bool ready = WriteIdMaps(pid, stderr);
+
+        // Create the cgroup and admit the child while it is still parked on the pipe, so
+        // the limits are in force before it execs the user command (FR-6.5). This has to
+        // happen here and nowhere else: the cloned child may not do managed I/O, and once
+        // it has chroot'd it cannot reach /sys/fs/cgroup at all. The child's *host-side*
+        // PID is what goes into cgroup.procs — the container's own PID-namespace numbering
+        // means nothing to the cgroup filesystem.
+        Cgroup? cgroup = null;
+        if (ready && options.Limits.Any)
         {
-            // Any byte will do; the child only cares that the read completes.
-            unsafe
-            {
-                byte go = 1;
-                Libc.Write(s_childWriteFd, (IntPtr)(&go), 1);
-            }
+            cgroup = Cgroup.Create(options.Limits, pid, stderr);
+            ready = cgroup is not null && cgroup.TryAddProcess(pid, stderr);
         }
 
-        // Closing unblocks the child even when the maps failed, so that case surfaces as
-        // the child exiting rather than as a hang.
-        Libc.Close(s_childWriteFd);
+        try
+        {
+            if (ready)
+            {
+                // Any byte will do; the child only cares that the read completes.
+                unsafe
+                {
+                    byte go = 1;
+                    Libc.Write(s_childWriteFd, (IntPtr)(&go), 1);
+                }
+            }
 
-        // Reap unconditionally. Even on the failure path the child exists and must be
-        // waited for, or we would exit leaving a zombie behind.
-        int code = WaitForExitCode(pid, stderr);
-        return mapped ? code : ExitCodes.RuntimeError;
+            // Closing unblocks the child even when setup failed, so that case surfaces as
+            // the child exiting rather than as a hang.
+            Libc.Close(s_childWriteFd);
+
+            // Reap unconditionally. Even on the failure path the child exists and must be
+            // waited for, or we would exit leaving a zombie behind.
+            int code = WaitForExitCode(pid, stderr);
+            return ready ? code : ExitCodes.RuntimeError;
+        }
+        finally
+        {
+            // Only removable once the container has been reaped and the cgroup is empty,
+            // which the waitpid above guarantees.
+            cgroup?.Dispose();
+        }
     }
 
     /// <summary>

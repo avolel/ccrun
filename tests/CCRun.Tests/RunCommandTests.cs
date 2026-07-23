@@ -31,6 +31,23 @@ public class RunCommandTests
         return true;
     }
 
+    /// <summary>
+    /// True when cgroup v2 is mounted and some ancestor of our own cgroup will let us
+    /// create a child with the memory and cpu controllers — the same search Cgroup.Create
+    /// does, which is the honest precondition for the Phase 6 tests. The probe cgroup is
+    /// disposed immediately, so nothing is left behind.
+    /// </summary>
+    internal static bool IsCgroupV2Delegated => s_cgroupV2Delegated.Value;
+
+    // Cached: the probe creates and removes a real directory, and test classes run in
+    // parallel, so asking once avoids two probes racing over the same name.
+    private static readonly Lazy<bool> s_cgroupV2Delegated = new(() =>
+    {
+        using var probe = Cgroup.Create(
+            new ResourceLimits(1L << 30, 1.0), Environment.ProcessId, TextWriter.Null);
+        return probe is not null;
+    });
+
     private static (int code, string err) Run(params string[] args)
     {
         var stderr = new StringWriter();
@@ -62,5 +79,23 @@ public class RunCommandTests
         var (code, err) = Run("run", "--rootfs", "/no/such/rootfs/xyz", "true");
         Assert.Equal(ExitCodes.RuntimeError, code);
         Assert.Contains("does not exist", err);
+    }
+
+    [Fact]
+    public void Run_BadMemoryValue_ReturnsUsageError()
+    {
+        // Limit values are validated at parse time, so a typo is a usage error and no
+        // namespace or cgroup is created — reachable on any host.
+        var (code, err) = Run("run", "--memory", "bogus", "true");
+        Assert.Equal(ExitCodes.UsageError, code);
+        Assert.Contains("invalid --memory value", err);
+    }
+
+    [Fact]
+    public void Run_BadCpusValue_ReturnsUsageError()
+    {
+        var (code, err) = Run("run", "--cpus", "0", "true");
+        Assert.Equal(ExitCodes.UsageError, code);
+        Assert.Contains("invalid --cpus value", err);
     }
 }

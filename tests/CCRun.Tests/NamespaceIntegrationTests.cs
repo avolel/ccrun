@@ -274,6 +274,137 @@ public class NamespaceIntegrationTests
         }
     }
 
+    // ---- Phase 6: cgroup v2 resource limits -------------------------------------------
+    //
+    // These read the container's cgroup from the *host* side. That is deliberate: the
+    // container has no cgroup namespace and no /sys mount of its own, so the honest place
+    // to observe the limits is /sys/fs/cgroup on the host. The container's own
+    // /proc/self/cgroup tells us which directory to look in — without --rootfs it sees the
+    // host's /proc, so the path it reports is the real one.
+
+    private static Process StartContainer(params string[] args)
+    {
+        var psi = new ProcessStartInfo("dotnet")
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        psi.ArgumentList.Add(Path.Combine(AppContext.BaseDirectory, "CCRun.dll"));
+        foreach (var a in args)
+            psi.ArgumentList.Add(a);
+        return Process.Start(psi) ?? throw new InvalidOperationException("failed to start ccrun");
+    }
+
+    // "0::/user.slice/.../ccrun-1234" -> "/sys/fs/cgroup/user.slice/.../ccrun-1234".
+    private static string CgroupDirectoryOf(string procSelfCgroup)
+    {
+        string line = procSelfCgroup.Split('\n').First(l => l.StartsWith("0::", StringComparison.Ordinal));
+        return "/sys/fs/cgroup" + line[3..].Trim();
+    }
+
+    [SkippableFact]
+    public void Cgroup_ContainerIsInItsOwnCgroup_WithTheRequestedLimits()
+    {
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
+        Skip.IfNot(RunCommandTests.IsCgroupV2Delegated, "requires a delegated cgroup v2 subtree with cpu+memory");
+
+        // FR-6.1/6.2/6.3: the container runs in a ccrun-owned cgroup carrying the limits.
+        // The limits must already be in place by the time the command runs, so the command
+        // reports its own cgroup and then idles while we inspect that directory.
+        string report = Path.Combine(Path.GetTempPath(), $"ccrun-cgroup-{Guid.NewGuid():N}");
+        string? dir = null;
+        using var container = StartContainer(
+            "run", "--memory", "128m", "--cpus", "0.5",
+            "/bin/sh", "-c", $"cat /proc/self/cgroup > {report}; sleep 30");
+        try
+        {
+            // Poll for a *non-empty* file: `cat > file` creates it before it writes, so
+            // existence alone would race us into reading nothing.
+            string reported = "";
+            var deadline = DateTime.UtcNow.AddSeconds(15);
+            while (reported.Length == 0 && !container.HasExited && DateTime.UtcNow < deadline)
+            {
+                reported = File.Exists(report) ? File.ReadAllText(report) : "";
+                if (reported.Length == 0)
+                    Thread.Sleep(50);
+            }
+            Assert.True(reported.Length > 0, "container never reported its cgroup");
+
+            dir = CgroupDirectoryOf(reported);
+            Assert.Matches(@"/ccrun-\d+$", dir);
+            Assert.Equal("134217728", File.ReadAllText(Path.Combine(dir, "memory.max")).Trim());
+            Assert.Equal("50000 100000", File.ReadAllText(Path.Combine(dir, "cpu.max")).Trim());
+        }
+        finally
+        {
+            if (!container.HasExited)
+                container.Kill(entireProcessTree: true);
+            container.WaitForExit();
+            File.Delete(report);
+
+            // The kill above is a SIGKILL, so ccrun's own cleanup never got to run and the
+            // (now empty) directory survives — see Cgroup_RemovedAfterContainerExits for
+            // the case ccrun is responsible for. Tidy up after ourselves rather than
+            // leaving one behind on every test run. rmdir fails while the kernel is still
+            // tearing the container's processes down, hence the short retry.
+            for (int attempt = 0; dir is not null && Directory.Exists(dir) && attempt < 20; attempt++)
+            {
+                try { Directory.Delete(dir); }
+                catch (IOException) { Thread.Sleep(50); }
+                catch (UnauthorizedAccessException) { break; }
+            }
+        }
+    }
+
+    [SkippableFact]
+    public void Cgroup_RemovedAfterContainerExits()
+    {
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
+        Skip.IfNot(RunCommandTests.IsCgroupV2Delegated, "requires a delegated cgroup v2 subtree with cpu+memory");
+
+        // FR-6.5: the cgroup lives exactly as long as the container. The command prints the
+        // directory it was placed in and exits; by the time ccrun returns, its own reap has
+        // happened and the rmdir with it.
+        var (code, stdout, _) = Run("run", "--memory", "128m", "/bin/sh", "-c", "cat /proc/self/cgroup");
+        Assert.Equal(0, code);
+
+        string dir = CgroupDirectoryOf(stdout);
+        Assert.Matches(@"/ccrun-\d+$", dir);
+        Assert.False(Directory.Exists(dir), $"cgroup {dir} was left behind");
+    }
+
+    [SkippableFact]
+    public void Cgroup_MemoryLimitIsEnforced_ProcessKilled()
+    {
+        Skip.IfNot(RunCommandTests.IsUserNsAvailable, "requires root or unprivileged user namespaces");
+        Skip.IfNot(RunCommandTests.IsCgroupV2Delegated, "requires a delegated cgroup v2 subtree with cpu+memory");
+
+        // FR-6.2, the acceptance test: a container that keeps allocating past its cap is
+        // killed rather than allowed to eat the host. A shell variable is grown a megabyte
+        // at a time, which allocates in the container's own address space and so charges
+        // to its cgroup.
+        using var container = StartContainer(
+            "run", "--memory", "16m",
+            "/bin/sh", "-c", "x=\"\"; while :; do x=\"$x$(head -c 1000000 /dev/zero | tr '\\0' a)\"; done");
+        try
+        {
+            // Bounded: if the kernel lets the container swap instead of killing it (swap
+            // accounting compiled out, so ccrun's memory.swap.max=0 never took), this would
+            // otherwise thrash forever. That is a host property, not a ccrun bug, so skip.
+            Skip.IfNot(container.WaitForExit(120_000), "container was not OOM-killed (no swap accounting on this host?)");
+
+            // 128 + SIGKILL, straight out of WaitForExitCode's signal branch.
+            Assert.Equal(137, container.ExitCode);
+        }
+        finally
+        {
+            if (!container.HasExited)
+                container.Kill(entireProcessTree: true);
+            container.WaitForExit();
+        }
+    }
+
     // Scans the host's /proc for a process whose command line contains `needle`. Entries
     // race with process exit, so unreadable ones are skipped rather than thrown on.
     private static int? FindHostPidByCmdline(string needle)

@@ -2,7 +2,7 @@
 
 A lightweight Linux container runtime written in C# / .NET 10 — a "Build Your
 Own Docker" learning project. It is developed in 8 phases; this repository is
-currently at **Phase 5 (rootless containers)**. `ccrun run <command>` puts the
+currently at **Phase 6 (resource limits)**. `ccrun run <command>` puts the
 command in a new user namespace and UTS namespace — so it gets its own hostname
 and runs as root *inside* the container without you being root outside — runs it,
 and propagates its exit code.
@@ -15,6 +15,9 @@ How much isolation you get depends on `--rootfs`:
   only container processes. The command runs as PID 1 of its own namespace.
 - **Without `--rootfs`** it stays at Phase 2 behaviour plus the user namespace:
   hostname isolation and rootless operation, nothing more.
+
+Independently of `--rootfs`, `--memory` and `--cpus` cap what the container may
+consume — see [Resource limits](#resource-limits).
 
 A *namespace* is the kernel feature that gives a process its own private copy of
 some global resource — its own hostname (UTS), its own process-ID numbering (PID),
@@ -30,8 +33,8 @@ the capabilities it grants, so **no sudo is required**. Your UID is mapped to 0
 inside the container, so a process there believes it is root, while the host still
 sees it as owned by you.
 
-Still missing: resource limits (cgroups), and image handling (`pull`, registry
-client). `pivot_root` is deferred; Phase 4 kept the plain `chroot`.
+Still missing: image handling (`pull`, registry client) — you still have to supply
+the rootfs yourself. `pivot_root` is deferred; Phase 4 kept the plain `chroot`.
 
 **New to the code?** [docs/code-overview/code-overview.md](docs/code-overview/code-overview.md) is a detailed,
 educational walkthrough of how the runtime works: the two-stage re-exec
@@ -44,7 +47,8 @@ libc P/Invoke layer, and how it is tested.
 - **.NET 10 SDK** (developed against 10.0.109)
 - **Linux** host, kernel **5.3 or newer** (ccrun creates its namespaces with the
   `clone3` syscall, added in 5.3)
-- **cgroup v2** (unified hierarchy) — required for the resource limits in Phase 6
+- **cgroup v2** (unified hierarchy), with a delegated subtree — only needed for
+  `--memory` / `--cpus`; see [Resource limits](#resource-limits)
 - **Unprivileged user namespaces enabled** — this is what lets ccrun run without
   sudo. Most distributions ship them on. To check:
 
@@ -68,10 +72,13 @@ ccrun/
     Program.cs         entrypoint, delegates to Cli
     Cli.cs             verb dispatch + usage
     ExitCodes.cs       named exit codes
-    RunOptions.cs      argument parsing for `run` (--hostname, --rootfs)
+    RunOptions.cs      argument parsing for `run` (--hostname, --rootfs, --memory, --cpus)
+    ResourceLimits.cs  parsed --memory/--cpus values in cgroup v2 units
     Commands/          RunCommand (parent stage) + ChildCommand (__child stage: sethostname, chroot, mount /proc, execvp)
     Native/            libc P/Invoke (clone3, sethostname, chroot, chdir, mount, execve/execvp, pipe, waitpid, geteuid/getegid)
-    Container/         ReExec (clone into namespaces, write the UID/GID maps, launch the child) + ProcessRunner (spawn command)
+    Container/         ReExec (clone into namespaces, write the UID/GID maps, launch the child)
+                       + Cgroup (create the container's cgroup, apply the limits, remove it)
+                       + ProcessRunner (spawn command)
   tests/CCRun.Tests/   xUnit test project
   alpine-rootfs/       downloaded Alpine root FS (git-ignored), used by --rootfs
 ```
@@ -139,6 +146,67 @@ Use **absolute** command paths with `--rootfs`: after `chroot`, a bare name is
 resolved against `PATH` *inside* the new root, so `/bin/busybox` is reliable where
 `busybox` may not be.
 
+## Resource limits
+
+Namespaces control what a container can *see*; **cgroups** control how much it can
+*take*. `--memory` and `--cpus` put the container in a cgroup v2 directory of its
+own for the duration of the run:
+
+```sh
+"$BIN" run --memory 128m --cpus 0.5 /bin/sleep 30
+```
+
+- `--memory <size>` accepts a plain byte count or a `b`/`k`/`m`/`g` suffix
+  (binary multiples, case-insensitive): `--memory 512m`, `--memory 1g`. Swap is
+  disabled for the container so the number is a hard cap — a process that exceeds
+  it is killed, and ccrun reports the shell's usual `137` (128 + SIGKILL).
+- `--cpus <n>` accepts a fraction or a whole number: `--cpus 0.5` is half a core,
+  `--cpus 2` is two cores' worth of CPU time.
+- Pass neither and the container is **unlimited**, exactly as before — no cgroup is
+  created at all.
+
+The cgroup is created before the command starts, so the limits are already in
+force, and removed once the container has exited. (If you `kill -9` ccrun itself,
+the now-empty directory survives — no cleanup code can run after SIGKILL.)
+
+To watch it work, start a container and look at its cgroup from the host:
+
+```sh
+"$BIN" run --memory 128m --cpus 0.5 /bin/sh -c 'cat /proc/self/cgroup; sleep 30' &
+# prints e.g. 0::/user.slice/user-1000.slice/user@1000.service/ccrun-14189
+D=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/ccrun-<pid>
+cat "$D/memory.max"   # 134217728
+cat "$D/cpu.max"      # 50000 100000
+```
+
+And to see the memory cap actually bite:
+
+```sh
+"$BIN" run --memory 16m /bin/sh -c 'x=""; while :; do x="$x$(head -c 1000000 /dev/zero | tr "\0" a)"; done'
+echo $?    # 137 — killed by the OOM killer
+```
+
+### Why this needs a delegated cgroup subtree
+
+`/sys/fs/cgroup` is owned by root, so an unprivileged ccrun cannot create a cgroup
+just anywhere — and needing `sudo` for it would undo Phase 5. What it uses instead
+is the subtree systemd **delegates** to your login session: ccrun starts at its own
+cgroup, walks up towards the root, and creates the container's cgroup under the
+first ancestor that will let it and that actually has the `memory` and `cpu`
+controllers available. On a typical systemd host that lands in
+`user@<uid>.service`. To check your session has them:
+
+```sh
+cat /sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.subtree_control
+# want 'cpu' and 'memory' in the output
+```
+
+If they are missing, `--memory`/`--cpus` fail with an explanation rather than
+running the container uncapped — silently ignoring a limit somebody asked for
+would be worse. Running ccrun as root also works, since root can write anywhere in
+the hierarchy. cgroup **v1** is not supported: the project targets the unified
+hierarchy only, and a v1-only host gets a clear error.
+
 ### Self-contained publish (later phases / NFR-1)
 
 The csproj is kept runtime-agnostic so it can target other architectures. To
@@ -174,5 +242,6 @@ above has moved on.
 - **Phase 3 — filesystem isolation (`chroot` into a root FS via `--rootfs`)** ✅ done
 - **Phase 4 — process isolation (PID + mount namespaces, private `/proc`)** ✅ done
 - **Phase 5 — rootless containers (user namespace + UID/GID mapping)** ✅ done
-- Phases 6–8 (cgroup resource limits, image pull, registry client) are
-  forthcoming. `pivot_root` remains deferred.
+- **Phase 6 — resource limits (cgroup v2 memory + CPU via `--memory`/`--cpus`)** ✅ done
+- Phases 7–8 (image pull, registry client) are forthcoming. `pivot_root` remains
+  deferred.

@@ -13,7 +13,7 @@ but the ideas behind it, so this document spends most of its time on the *why*.
 ## Where the project stands
 
 CCRun is planned as eight phases. Each phase adds one real piece of isolation.
-As of this writing the runtime is through **Phase 5**, which means it can do four
+As of this writing the runtime is through **Phase 6**, which means it can do five
 things that matter:
 
 1. **Hostname isolation** (Phase 2). A container gets its own hostname, and
@@ -30,6 +30,10 @@ things that matter:
    which the invoking user's ID is mapped to 0. The command believes it is root
    and holds the capabilities the steps above need, while the host still sees an
    ordinary unprivileged process. `ccrun` no longer needs `sudo`.
+5. **Resource limits** (Phase 6). With `--memory` and/or `--cpus`, the container
+   runs in a cgroup v2 directory of its own that caps how much memory and CPU time
+   it may consume. Namespaces answer "what can it *see*"; cgroups answer "how much
+   can it *take*", and a runtime needs both.
 
 That third one is what makes the container start to *feel* like a container. Up
 through Phase 3 you could chroot into Alpine and still see every process on the
@@ -45,10 +49,10 @@ that a runtime never signed up for. Keeping the rule "`--rootfs` means a real
 container, bare `run` means hostname only" makes that boundary obvious and mirrors
 the chroot gate that already existed.
 
-What is still missing: no resource limits via cgroups, and no image handling. A
-real `docker run alpine` pulls an image and caps memory and CPU. CCRun does
-neither yet. Those are Phases 6 through 8, and the code is structured so they slot
-in cleanly. More on that at the end.
+What is still missing: image handling. A real `docker run alpine` pulls an image
+from a registry and unpacks it; CCRun still expects you to hand it a rootfs
+directory. That is Phases 7 and 8, and the code is structured so they slot in
+cleanly. More on that at the end.
 
 Creating namespaces, mounting filesystems, and calling `chroot` all require Linux
 *capabilities* — individual slices of root's authority, here `CAP_SYS_ADMIN` for
@@ -141,8 +145,9 @@ that bites naive parsers:
   *after* the command are not treated as CCRun options. `ccrun run echo --rootfs
   /r` runs `echo` with the literal arguments `--rootfs /r`. That is the correct
   behavior: once you name the command, the rest belongs to it.
-- Both `--rootfs /path` and `--rootfs=/path` forms are accepted, mirroring how
-  `--hostname` already worked.
+- Every option accepts both the `--opt value` and the `--opt=value` form, which is
+  why the branches all route through one `TryTakeValue` helper rather than each
+  spelling the two cases out.
 
 One design choice matters for later: **the parser does no filesystem work.** It
 does not check whether the rootfs exists, does not resolve paths, does not touch
@@ -156,6 +161,7 @@ The result is an immutable `record`:
 public sealed record RunOptions(
     string Hostname,
     string? Rootfs,
+    ResourceLimits Limits,
     string Command,
     IReadOnlyList<string> CommandArgs);
 ```
@@ -163,6 +169,15 @@ public sealed record RunOptions(
 `Rootfs` is nullable, and null carries real meaning: it means "no chroot, behave
 like Phase 2." That single nullable field is what makes filesystem isolation
 opt-in and backward compatible.
+
+[ResourceLimits](../../src/CCRun/ResourceLimits.cs) plays the same trick for Phase 6.
+Both of its fields are nullable, and `Limits.Any` being false is what makes the
+entire cgroup machinery skip itself, so a run with no limits behaves exactly as it
+did before the phase existed. The one thing the parser *does* do here is convert
+and validate: `--memory 512m` becomes a byte count and `--cpus 0.5` a double, and
+a value that is not a positive size or number is a usage error reported before any
+namespace exists. Unit conversion is pure string work, so it belongs with the
+parser rather than in the code that talks to the kernel.
 
 ### The parent stage: creating the namespace
 
@@ -602,6 +617,113 @@ through, no stale mounts accumulating on the host after a crash. It is also the 
 option available, since after `execvp` replaces the process image there is no CCRun
 code left to run a cleanup handler.
 
+## Resource limits and the cgroup
+
+Namespaces are about *visibility*: what a process can see and name. They say
+nothing about consumption. A container in its own PID namespace with its own root
+filesystem can still allocate every page of RAM on the machine and spin every core.
+The kernel feature that bounds consumption is the **control group**, and Phase 6
+adds cgroup v2 support behind `--memory` and `--cpus`.
+
+The model is simple once you see it. `/sys/fs/cgroup` is a synthetic filesystem
+where **a directory is a cgroup**. You create one with `mkdir`, set a limit by
+writing a number to one of the interface files the kernel puts inside it
+(`memory.max`, `cpu.max`), and put a process in it by writing that process's PID to
+`cgroup.procs`. Children inherit their parent's cgroup, so admitting one process
+captures the whole tree it goes on to spawn. Deleting the cgroup is `rmdir`, which
+the kernel allows only once the directory holds no processes.
+
+`cpu.max` is the only value that needs decoding. It is written as two numbers,
+`"<quota> <period>"`, both in microseconds, and it means "this cgroup may use
+*quota* microseconds of CPU time in every *period*". CCRun fixes the period at the
+kernel default of 100 000µs, so `--cpus 0.5` becomes `50000 100000`. Quota is
+allowed to exceed period — that is how you express a limit larger than one core:
+`--cpus 2` is `200000 100000`.
+
+**Where the work happens, and why it cannot happen anywhere else.** All of it is in
+the parent, in the window `ReExec.RunChild` already had between `clone3` returning
+and the go-byte that releases the child:
+
+```
+clone3 → WriteIdMaps(pid) → cgroup: mkdir + limits + cgroup.procs → go-byte → child execs
+```
+
+Three separate constraints force that placement, and any one of them would be
+enough:
+
+- The limits have to be in force *before* the user command runs, and at this point
+  the child is parked on the pipe read, which is the only moment we can be sure it
+  has not started yet.
+- The cloned child may not allocate, JIT, or do managed I/O (see the
+  [rules for that method](#the-clone-launching-ourselves-as-the-child)), so it
+  cannot open and write cgroup files itself.
+- After `chroot` the child cannot even *reach* `/sys/fs/cgroup` — it is outside the
+  new root.
+
+So the parent does it, using the child's **host-side** PID. That distinction
+matters: the container thinks it is PID 1, but `cgroup.procs` is a host interface
+and knows nothing about the container's PID namespace.
+
+**Finding a directory we are allowed to create.** This is the part that is genuinely
+about rootless containers rather than about cgroups. `/sys/fs/cgroup` itself is
+root-owned; an unprivileged user cannot `mkdir` there, and Phase 5 exists precisely
+so ccrun does not need root. What an unprivileged user *does* usually have on a
+systemd host is a **delegated subtree** — systemd hands the user's login session
+(`user.slice/user-<uid>.slice/user@<uid>.service`) ownership of its own cgroup
+directory and the controllers listed in its `cgroup.subtree_control`, and inside
+that subtree the user may create cgroups freely.
+
+[Cgroup.Create](../../src/CCRun/Container/Cgroup.cs) therefore does not hard-code a
+path. It reads our own cgroup out of `/proc/self/cgroup` and walks *up* towards the
+mount root, trying each ancestor in turn, and takes the first one where two things
+hold: the `mkdir` succeeds, and the resulting directory actually contains the
+interface files for the controllers we need. That second check is the interesting
+one — it is how we detect delegation. A controller only exists in a child cgroup if
+the parent enabled it in `cgroup.subtree_control`, and rather than parse that file
+and reason about what it implies, we create the directory and ask the kernel the
+same question directly: is `memory.max` there or not? If not, we `rmdir` and keep
+walking. The nearest ancestors typically fail this way, because the leaf cgroup
+holding our own process cannot delegate controllers while it holds tasks (cgroup
+v2's "no internal processes" rule), so the search usually settles on the session
+service a couple of levels up.
+
+If no ancestor works, the run fails with an explanation rather than proceeding.
+Running a container *without* the limit the user explicitly asked for is worse than
+not running it: the whole point of `--memory` is that something on the other side is
+counting on the cap.
+
+**Why swap is turned off too.** Alongside `memory.max`, CCRun writes
+`memory.swap.max = 0`. Left at the default, a container that hits its memory limit
+does not die — it starts swapping, and a runaway allocation thrashes indefinitely
+instead of being killed. The limit technically holds, but nothing observable
+happens, which is not what someone typing `--memory 16m` is asking for. Denying swap
+makes the number a hard cap, and a container that exceeds it is SIGKILLed by the
+OOM killer. `WaitForExitCode`'s signal branch then reports the conventional
+`128 + 9 = 137`, exactly as a shell would.
+
+**Cleanup.** `rmdir` only succeeds on an empty cgroup, so removal has to wait for
+the container to be reaped — which is what the existing `waitpid` in `RunChild`
+already does. The `Dispose` therefore hangs off a `finally` around that call, and it
+is deliberately quiet about failure: a container that somehow left a descendant
+behind keeps the directory busy, and failing an otherwise successful run over a
+stray empty directory would be a poor trade. Note the contrast with the `/proc`
+mount, which needs no cleanup at all because the kernel destroys the mount namespace
+with its last member. A cgroup is not tied to any namespace's lifetime, so this one
+really does have to be cleaned up by hand.
+
+Which exposes the one hole: if the ccrun *parent* is itself SIGKILLed, no cleanup
+code runs and an empty `ccrun-<pid>` directory is left behind. Nothing in-process
+can fix that — SIGKILL is by definition unhandleable — and it is a good part of why
+real runtimes put a supervising daemon or shim outside the container. An empty
+cgroup costs nothing but a directory entry, so CCRun accepts the hole rather than
+growing a supervisor for it.
+
+One consequence worth knowing: the `__child` stage runs *inside* the container's
+cgroup, so the .NET runtime's own memory is charged against `--memory` until it
+`exec`s away. In practice the pages it inherited from the parent stay charged to the
+parent's cgroup — cgroup v2 does not re-charge existing pages when a process is
+moved — so the overhead is small, but a limit of a few megabytes is not realistic.
+
 ## Why `execvp` here but `Process.Start` elsewhere
 
 This is the most subtle decision in the phase, and it is worth slowing down for.
@@ -763,11 +885,17 @@ The pure, always-run tests cover the parts that touch no privileged syscalls:
 - [ProcessRunnerTests](../../tests/CCRun.Tests/ProcessRunnerTests.cs) checks the
   child-process exit-code contract on the non-chroot path, which is exactly why
   that path was kept on `Process.Start`.
+- [ResourceLimitsTests](../../tests/CCRun.Tests/ResourceLimitsTests.cs) is a table of
+  `--memory`/`--cpus` values and the numbers they should become, including the ones
+  that must be rejected (zero, negative, a bad suffix, a size that would overflow a
+  `long`). Keeping the unit conversion in a pure type is what makes this possible
+  without a cgroup anywhere in sight.
 - [RunCommandTests](../../tests/CCRun.Tests/RunCommandTests.cs) covers parent-stage
-  behavior that returns *before* any namespace is created — argument errors and the
-  missing-rootfs error — and hosts the `IsRoot` / `IsUserNsAvailable` gates the
-  integration tests share. These are reachable with no privileges precisely because
-  validation runs before any namespace work.
+  behavior that returns *before* any namespace is created — argument errors, the
+  missing-rootfs error, a malformed limit value — and hosts the `IsRoot` /
+  `IsUserNsAvailable` / `IsCgroupV2Delegated` gates the integration tests share.
+  These are reachable with no privileges precisely because validation runs before
+  any namespace work.
 
 The tests that genuinely need privileges live in
 [NamespaceIntegrationTests](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs) and
@@ -815,6 +943,28 @@ mount is gone either way. So the container touches a marker file and then idles;
 the test polls for the marker, reads `/proc/self/mounts` on the host while the
 container is definitely live, and kills it in a `finally`.
 
+The three Phase 6 tests have a gate of their own, `IsCgroupV2Delegated`, and it is
+worth noting how it is written: instead of guessing at the host's layout, it runs
+the *same* search `Cgroup.Create` does and reports whether it found somewhere
+usable. The precondition for the tests is then exactly the precondition for the
+feature, so they cannot skip on a host where the feature works or fail on one where
+it does not.
+
+The tests themselves read the limits from the **host** side, because the container
+has no cgroup namespace and no `/sys` of its own. Getting the path is easier than it
+sounds: without `--rootfs` the container sees the host's `/proc`, so the command can
+simply `cat /proc/self/cgroup` and tell us which directory it landed in.
+`Cgroup_ContainerIsInItsOwnCgroup_WithTheRequestedLimits` has it write that path to
+a file and then idle, so the values can be checked while the container is
+demonstrably live — the same trick the mount-namespace test uses, and for the same
+reason. `Cgroup_RemovedAfterContainerExits` gets the path from the container's
+stdout and asserts the directory is gone by the time ccrun returns, which is FR-6.5.
+`Cgroup_MemoryLimitIsEnforced_ProcessKilled` grows a shell variable a megabyte at a
+time under a 16 MB cap and asserts the exit code is 137; it gives up with a skip
+rather than hanging if the host turns out to have no swap accounting, since then
+ccrun's `memory.swap.max` write cannot take and the container would thrash instead
+of dying.
+
 The chroot tests have a second gate. They call a small helper,
 [FindAlpineRootfs](../../tests/CCRun.Tests/NamespaceIntegrationTests.cs#L73), that walks
 up from the test binary's directory looking for `alpine-rootfs/ALPINE_FS_ROOT`
@@ -846,14 +996,22 @@ the .NET runtime's laziness fights low-level process work: the warm-ups, the mov
 off `Win32Exception`, and now the pre-JIT of the cloned child's code path all exist
 for that reason.
 
+Phase 6 was the easy one by comparison, and that is the architecture paying off:
+the cgroup work needed no new stage, no new env var and no change to the child at
+all, because the parent already held the child's PID and already had a window in
+which the child was guaranteed not to have started. The prediction made here before
+Phase 6 — that rootless cgroups would interact with Phase 5 more than they first
+appear — held exactly: nearly all the difficulty was in *finding a directory an
+unprivileged user may write to*, not in writing the limits.
+
 Here is the rest of the trajectory:
 
-- **Phase 6** adds cgroup v2 for CPU and memory limits — writing to the unified
-  `/sys/fs/cgroup` hierarchy to cap what the container may consume. Note that
-  rootless cgroup control needs either a delegated cgroup subtree or systemd's
-  help, so this phase interacts with Phase 5 more than it first appears.
 - `pivot_root` remains deferred, and is the natural companion to whichever phase
   next needs a stronger filesystem boundary than `chroot` provides.
+- A `--pids-limit` would drop straight into `ResourceLimits` and `Cgroup` — the
+  pids controller works exactly like the two already here — and mounting the
+  container's own cgroup at `/sys/fs/cgroup` inside it would need a cgroup
+  namespace, which is a fifth `CLONE_*` flag and little else.
 - **Phases 7 and 8** add image handling: pulling from a registry and unpacking
   layers into the rootfs that `--rootfs` points at today.
 

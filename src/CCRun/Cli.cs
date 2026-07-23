@@ -43,13 +43,16 @@ public static class Cli
         w.WriteLine("ccrun: a lightweight Linux container runtime");
         w.WriteLine();
         w.WriteLine("usage:");
-        w.WriteLine("  ccrun run [--hostname <name>] [--rootfs <path>] <command> [args...]   run a command in a container");
+        w.WriteLine("  ccrun run [--hostname <name>] [--rootfs <path>] [--memory <size>] [--cpus <n>] <command> [args...]");
+        w.WriteLine("                                  run a command in a container");
         w.WriteLine("  ccrun --help                    show this help");
         w.WriteLine();
-        w.WriteLine("Phase 5: 'run' isolates the hostname (UTS ns) and runs rootless in a user namespace,");
+        w.WriteLine("Phase 6: 'run' isolates the hostname (UTS ns) and runs rootless in a user namespace,");
         w.WriteLine("so the command is root inside the container while staying your user on the host — no sudo.");
         w.WriteLine("With --rootfs it also chroots into the root FS and adds PID + mount namespaces with a");
         w.WriteLine("private /proc, so it sees only its own processes.");
+        w.WriteLine("--memory/--cpus cap the container via a cgroup v2 subtree (e.g. --memory 512m --cpus 0.5);");
+        w.WriteLine("without them the container is unlimited.");
         w.WriteLine("Requires unprivileged user namespaces to be enabled (or run as root).");
     }
 }

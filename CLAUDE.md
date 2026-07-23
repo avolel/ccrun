@@ -5,8 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 CCRun is a "Build Your Own Docker" learning project: a lightweight Linux container
-runtime in C# / .NET 10, built in 8 phases. **The repo is currently at Phase 5
-(rootless containers).** `ccrun run <command>` puts the command in a new user +
+runtime in C# / .NET 10, built in 8 phases. **The repo is currently at Phase 6
+(resource limits).** `ccrun run <command>` puts the command in a new user +
 UTS namespace so it gets its own hostname and runs as root inside the container
 without the invoker being root outside, runs it, and passes back its exit code.
 
@@ -23,9 +23,13 @@ deliberate:
   `Process.Start`. It deliberately stays here because that path must not become
   PID 1 of a PID namespace.
 
-Still missing: resource limits (cgroups, Phase 6) and image handling (`pull`,
-registry client). `pivot_root` is deferred — Phase 4 kept the plain `chroot`,
-since the FR-4.x/5.x requirements do not need the stronger boundary.
+Orthogonally to `--rootfs`, **`--memory` and `--cpus` (Phase 6)** put the container
+in a cgroup v2 directory of its own carrying those limits. Requesting neither skips
+the whole mechanism, so an unlimited run behaves exactly as it did in Phase 5.
+
+Still missing: image handling (`pull`, registry client). `pivot_root` is deferred —
+Phase 4 kept the plain `chroot`, since the FR-4.x/5.x requirements do not need the
+stronger boundary.
 
 Namespaces and mounts need `CAP_SYS_ADMIN` and `chroot` needs `CAP_SYS_CHROOT`,
 neither of which an ordinary user has. Phase 5 gets them the only way an
@@ -70,6 +74,14 @@ that will hang or abort the runtime if disturbed:
   carry `[SuppressGCTransition]`, `PrepareClonedChildPath` pre-compiles the method
   and pre-resolves its stubs, and the pipe is `O_CLOEXEC` so no `close` is needed.
   Anything added to that method must keep all of those rules.
+- **The cgroup work has exactly one legal place: the parent, between `clone3` and
+  the go-byte.** Three constraints force it. The limits must be in force before the
+  user command runs, and the child is parked on the pipe there; the cloned child
+  cannot write the files itself (no managed I/O — see above); and after `chroot` it
+  cannot reach `/sys/fs/cgroup` at all. The pid written to `cgroup.procs` is the
+  child's **host-side** pid — `cgroup.procs` knows nothing about the container's PID
+  namespace. Cleanup hangs off the existing `waitpid`, because `rmdir` on a cgroup
+  only succeeds once it is empty.
 - **The UID/GID maps must be written by the parent, before the child execs.** A new
   user namespace starts with empty maps, in which every id is the overflow uid
   (nobody), and `execve` clears the permitted capability set for a non-root uid with
@@ -90,8 +102,16 @@ rather than `Process.Start`, because after `chroot` the .NET runtime's own files
 may sit outside the new root; the no-`--rootfs` path keeps `Process.Start`. See
 `docs/code-overview/code-overview.md` for a full walkthrough of how it works.
 
-Remaining phases add: cgroup v2 resource limits (6), and image pull + registry
-client (7–8).
+Cgroups are the one part that cannot be pinned to a fixed path: `/sys/fs/cgroup` is
+not writable by an unprivileged user, so `Cgroup.Create` walks up from our own
+cgroup and uses the first ancestor that both accepts a `mkdir` and yields the
+controller files we need (`memory.max`, `cpu.max`) — i.e. the subtree systemd
+delegated to the user session. Probing for the interface files is the delegation
+test; do not replace it with a fixed `/sys/fs/cgroup/ccrun/` path, which would
+require root and regress Phase 5. `--memory` also writes `memory.swap.max=0`, or the
+cgroup swaps instead of OOM-killing and the cap never visibly bites.
+
+Remaining phases add: image pull + registry client (7–8).
 
 ## Commands
 
@@ -121,6 +141,9 @@ $BIN run --rootfs alpine-rootfs /bin/busybox sh -c 'echo $$'   # prints: 1
 $BIN run --rootfs alpine-rootfs /bin/busybox ps                # only container procs
 # rootless proof: the host shows the process owned by *you*, not root
 $BIN run /bin/sleep 500 & ps -o pid,user,cmd -C sleep; kill %1
+# resource limits: the container's cgroup path, then the cap biting (exit 137)
+$BIN run --memory 128m --cpus 0.5 /bin/sh -c 'cat /proc/self/cgroup'
+$BIN run --memory 16m /bin/sh -c 'x=""; while :; do x="$x$(head -c 1000000 /dev/zero | tr "\0" a)"; done'
 ```
 
 Note `--rootfs` paths resolve against the **current directory**, so run from the
@@ -138,7 +161,10 @@ unprivileged.
 - `src/CCRun/` — the CLI console app (`net10.0`). `Program.cs` is a thin
   top-level-statement entrypoint that delegates to `Cli.Run`. `Cli.cs` does
   verb dispatch and usage; `ExitCodes.cs` holds named exit codes; `RunOptions.cs`
-  parses the arguments to `run` (`--hostname`, `--rootfs`). `Commands/` has one
+  parses the arguments to `run` (`--hostname`, `--rootfs`, `--memory`, `--cpus`) and
+  `ResourceLimits.cs` holds the parsed limits, already converted to cgroup v2 units
+  (nullable throughout — `Limits.Any == false` is what skips the cgroup entirely).
+  `Commands/` has one
   class per command: `RunCommand` is the parent/host stage (validates `--rootfs`,
   picks the namespace flag set — user + UTS always, plus mount + PID when a rootfs
   was given — and delegates to `ReExec`), and the hidden `ChildCommand` is the
@@ -156,22 +182,32 @@ unprivileged.
   namespaces, writes that child's UID/GID maps (`WriteIdMaps`) while it blocks on a
   pipe, then reaps it and translates the wait status into an exit code. Hostname and
   rootfs still travel to the child via the `CCRUN_HOSTNAME`/`CCRUN_ROOTFS` env vars.
+  `Cgroup` is Phase 6: it finds a writable delegated cgroup v2 subtree, creates the
+  container's own directory in it, writes `memory.max`/`memory.swap.max`/`cpu.max`,
+  admits the child via `cgroup.procs`, and `rmdir`s it on `Dispose` — all driven from
+  the same post-`clone3` window in `ReExec.RunChild`, so nothing crosses the exec.
   `ProcessRunner` spawns the user command on the no-`--rootfs` path and returns its
   exit code. Command logic takes injectable `TextWriter` stdout/stderr (no `Console`
   statics) so it is unit-testable.
 - `tests/CCRun.Tests/` — xUnit tests, references `src/CCRun`. `CliTests` covers
   verb dispatch and usage; `RunOptionsTests` covers argument parsing;
   `ProcessRunnerTests` asserts the child-process exit-code contract;
+  `ResourceLimitsTests` tables the `--memory`/`--cpus` conversions and rejections;
   `RunCommandTests` covers the parent stage's pre-namespace paths (argument errors,
-  the missing-`--rootfs` error) and hosts the `IsRoot` / `IsUserNsAvailable` gates;
+  the missing-`--rootfs` error, malformed limit values) and hosts the `IsRoot` /
+  `IsUserNsAvailable` / `IsCgroupV2Delegated` gates;
   `NamespaceIntegrationTests` exercises the full clone3 + sethostname + chroot +
   `/proc` + execvp pipeline, including the PID-1, private-`/proc`,
-  host-mount-isolation, and the two Phase 5 rootless assertions (container root is
-  uid 0 inside; the host sees the process owned by the invoking user). They are
+  host-mount-isolation, the two Phase 5 rootless assertions (container root is
+  uid 0 inside; the host sees the process owned by the invoking user), and the three
+  Phase 6 cgroup ones (the container is in `ccrun-<pid>` with the requested
+  `memory.max`/`cpu.max`; the directory is gone after it exits; a container over its
+  memory cap exits 137). They are
   gated on `IsUserNsAvailable` — root *or* unprivileged user namespaces — so a
   normal `dotnet test` runs them; they skip (via `Xunit.SkippableFact`) only where
   user namespaces are disabled. The chroot tests additionally skip if
-  `alpine-rootfs/` is absent.
+  `alpine-rootfs/` is absent, and the cgroup tests if no delegated subtree exists
+  (`IsCgroupV2Delegated` probes with the very same search `Cgroup.Create` performs).
   **`NamespaceIntegrationTests` must spawn the ccrun binary out-of-process** (it
   does, via `dotnet <testdir>/CCRun.dll`), never `Cli.Run` in-process like the other
   classes. Running out-of-process keeps each container's process tree, `clone3`
@@ -185,7 +221,8 @@ unprivileged.
   mountpoint for the private `/proc` (the stock minirootfs does).
 - `docs/code-overview/code-overview.md` — a detailed, educational walkthrough of the whole runtime
   (the two-stage re-exec model, the `run` trace, chroot, the PID/mount namespaces
-  and private `/proc`, `execvp` vs `Process.Start`, the libc layer, and testing).
+  and private `/proc`, the cgroup and its delegated-subtree search, `execvp` vs
+  `Process.Start`, the libc layer, and testing).
   Start here to understand *how* the code works.
 
 ## Conventions / constraints
