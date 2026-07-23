@@ -233,14 +233,3 @@ unprivileged.
   `RuntimeIdentifier`) so it can cross-compile to arm64 — select the RID at
   `publish` time instead.
 - `InvariantGlobalization` is on for lean self-contained builds.
-
-## Git Policy
-
-**Claude is NEVER allowed to commit to this repository.**
-
-Claude may stage files and draft a commit message, but must stop there. The human reviews the staged changes and runs `git commit` manually.
-
-## Working agreement
-When proposing a plan or a change set, always list every new/updated file and include the full code to be added/changed, so it can be reviewed before implementation.
-
-All prose — code comments, README updates, CLAUDE.md updates, and any other documentation — must be written in plain English aimed at a mid- to senior-level software engineer. Explain the *why* and any non-obvious behaviour; skip explanations of language basics or things the code already states plainly.
