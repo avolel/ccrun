@@ -13,8 +13,10 @@ but the ideas behind it, so this document spends most of its time on the *why*.
 ## Where the project stands
 
 CCRun is planned as eight phases. Each phase adds one real piece of isolation.
-As of this writing the runtime is through **Phase 6**, which means it can do five
-things that matter:
+As of this writing the runtime is through **Phase 7**. Phases 2–6 build the
+container runtime (five things that matter, below); Phase 7 is a self-contained
+image client — `ccrun pull` — that produces a rootfs the runtime consumes but
+touches none of its machinery (see [Pulling an image](#pulling-an-image-phase-7)).
 
 1. **Hostname isolation** (Phase 2). A container gets its own hostname, and
    changing it does not touch the host's hostname. This is done with a UTS
@@ -49,10 +51,12 @@ that a runtime never signed up for. Keeping the rule "`--rootfs` means a real
 container, bare `run` means hostname only" makes that boundary obvious and mirrors
 the chroot gate that already existed.
 
-What is still missing: image handling. A real `docker run alpine` pulls an image
-from a registry and unpacks it; CCRun still expects you to hand it a rootfs
-directory. That is Phases 7 and 8, and the code is structured so they slot in
-cleanly. More on that at the end.
+A real `docker run alpine` pulls an image from a registry and unpacks it. As of
+Phase 7, `ccrun pull` does the pulling and unpacking (see
+[Pulling an image](#pulling-an-image-phase-7)); what is still missing is running an
+image *by name* and applying its config — you `pull`, then point `run --rootfs` at
+the extracted directory. That last step is Phase 8, and the code is structured so
+it slots in cleanly. More on that at the end.
 
 Creating namespaces, mounting filesystems, and calling `chroot` all require Linux
 *capabilities* — individual slices of root's authority, here `CAP_SYS_ADMIN` for
@@ -977,6 +981,76 @@ writers, keeping the parser free of side effects, and validating before the
 privileged syscall, are what let most of the runtime be tested on a laptop with
 no sudo. Only the genuinely privileged behavior needs a privileged test.
 
+## Pulling an image (Phase 7)
+
+Everything up to here is the *runtime*: it takes a rootfs you already have and
+isolates a process inside it. Phase 7 answers the other half of "what does
+`docker run ubuntu` do" — where the rootfs *comes from*. It is a self-contained
+subsystem under `src/CCRun/Registry/` that writes a directory tree; it shares no
+code with the namespace/clone3/cgroup machinery, and `run --rootfs` consumes its
+output unchanged. There is no daemon and no Docker CLI involved — just an
+anonymous, read-only client for the Docker Registry HTTP API V2.
+
+`ccrun pull ubuntu` runs this pipeline, all in `PullCommand`:
+
+1. **Parse and normalize the reference** (`ImageReference`). `ubuntu` expands to
+   registry `registry-1.docker.io`, repository `library/ubuntu`, tag `latest`,
+   the same shorthands the Docker CLI uses. `:tag` and `@sha256:…` digests parse
+   too. This is pure string work with no I/O, tested in isolation.
+
+2. **Get an anonymous bearer token** (`RegistryClient.GetTokenAsync`). Docker Hub
+   requires a token even for public pulls; a GET to `auth.docker.io` with a
+   `repository:<repo>:pull` scope returns one, no credentials needed.
+
+3. **Fetch the manifest, following a multi-arch index** (`GetManifestAsync`).
+   Modern `library/*` images do not return a manifest directly — they return an
+   **OCI image index** (a.k.a. Docker *manifest list*), which maps platforms to
+   per-platform manifests. The client asks with all four relevant `Accept` media
+   types, and if the answer is an index it runs `Manifests.SelectPlatformDigest`
+   to pick the `linux/<host-arch>` child — skipping the `architecture: "unknown"`
+   *attestation* entries that would otherwise be mistaken for a real image — then
+   re-fetches that child by digest. `SelectPlatformDigest` is a pure function and
+   is the unit-tested heart of the multi-arch logic.
+
+4. **Download and verify each layer, streaming** (`DownloadBlobAsync` + `Digest`).
+   Layers are content-addressed by SHA-256. The client streams each blob to a
+   temp file while feeding an `IncrementalHash`, then compares the result to the
+   digest in the manifest — so a corrupt or tampered layer aborts the pull, and no
+   layer is ever held in memory in full.
+
+5. **Extract layers in order, honoring whiteouts** (`TarExtractor` via
+   `ImageStore`). Each verified layer is a gzipped tar; they are unpacked *in
+   manifest order* onto the same rootfs, so upper layers overwrite lower ones. An
+   overlay *whiteout* — a `.wh.<name>` marker file — means "delete `<name>` from
+   the layers below," and `.wh..wh..opq` means "ignore everything below in this
+   directory"; the extractor applies these instead of writing the markers, which
+   is how a multi-layer image reconstructs a file that a later layer deleted.
+
+The security-sensitive part is `TarExtractor`, because a tar archive is untrusted
+input describing paths, and a malicious layer will try to write outside the rootfs.
+Two guards, not one:
+
+- **Lexical containment.** Each entry's target is resolved with `Path.GetFullPath`
+  (which collapses `..`) and rejected unless it stays under the canonicalized
+  rootfs prefix. This is the same technique `RunCommand` uses on the single
+  `--rootfs` path a human types.
+- **No writing *through* a symlink.** Lexical checking alone is not enough, and
+  this is the subtle part. `Path.GetFullPath` does not resolve symlinks, so a
+  layer can plant a symlink `foo -> /etc` and then, in a later entry, write
+  `foo/passwd`: lexically `foo/passwd` is inside the rootfs, but the write follows
+  the link out to `/etc/passwd` on the host. This is a real CVE class in container
+  runtimes. So before writing, the extractor walks the target's existing parent
+  directories and refuses if any is a symlink, and it deletes a symlink-to-a-dir
+  as a *link* rather than recursing into the linked target.
+
+`ImageStore` owns the on-disk layout — `~/.ccrun/images/<repository>/<tag>/` with a
+`rootfs/` directory and a `config.json` beside it — clears any stale rootfs before
+a re-pull, and drives the per-layer extraction. The stored `config.json` (the image
+config blob: env, entrypoint, working dir) is not used yet; Phase 8 will read it to
+run an image by name. The `rootfs/` is a perfectly ordinary directory, which is the
+whole point: `ccrun run --rootfs ~/.ccrun/images/library/ubuntu/latest/rootfs …`
+runs a pulled image *today*, on the unchanged Phase 6 stack.
+
 ## Where this goes next
 
 The two-stage architecture was not built just for hostname and chroot. It exists
@@ -1012,8 +1086,12 @@ Here is the rest of the trajectory:
   pids controller works exactly like the two already here — and mounting the
   container's own cgroup at `/sys/fs/cgroup` inside it would need a cgroup
   namespace, which is a fifth `CLONE_*` flag and little else.
-- **Phases 7 and 8** add image handling: pulling from a registry and unpacking
-  layers into the rootfs that `--rootfs` points at today.
+- **Phase 7** (done) added the image client: pulling from Docker Hub and unpacking
+  layers into a rootfs that `--rootfs` points at — see
+  [Pulling an image](#pulling-an-image-phase-7). It deliberately reused nothing of
+  the runtime, which is why it slotted in without touching a single syscall.
+- **Phase 8** will close the loop: `ccrun run ubuntu …` resolving a name to a
+  pulled image and applying its stored config (env, entrypoint, working dir).
 
 Read in that light, each file you have just walked through is a small, honest
 version of a piece of a real runtime, with room left for the next layer. If you

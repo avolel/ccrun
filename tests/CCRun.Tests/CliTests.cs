@@ -43,4 +43,20 @@ public class CliTests
         Assert.Equal(ExitCodes.UsageError, code);
         Assert.Contains("missing command", err);
     }
+
+    [Fact]
+    public void PullWithoutImage_DispatchesAndFails()
+    {
+        // Proves `pull` reaches PullCommand without touching the network.
+        var (code, _, err) = RunCli("pull");
+        Assert.Equal(ExitCodes.UsageError, code);
+        Assert.Contains("missing image reference", err);
+    }
+
+    [Fact]
+    public void Help_ListsPullVerb()
+    {
+        var (_, outText, _) = RunCli("--help");
+        Assert.Contains("ccrun pull", outText);
+    }
 }

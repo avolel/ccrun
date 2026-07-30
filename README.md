@@ -2,7 +2,9 @@
 
 A lightweight Linux container runtime written in C# / .NET 10 — a "Build Your
 Own Docker" learning project. It is developed in 8 phases; this repository is
-currently at **Phase 6 (resource limits)**. `ccrun run <command>` puts the
+currently at **Phase 7 (image pull)**. `ccrun pull <image>` fetches an image from
+Docker Hub into a local store that `run --rootfs` can then use — see
+[Pulling images](#pulling-images). `ccrun run <command>` puts the
 command in a new user namespace and UTS namespace — so it gets its own hostname
 and runs as root *inside* the container without you being root outside — runs it,
 and propagates its exit code.
@@ -33,8 +35,9 @@ the capabilities it grants, so **no sudo is required**. Your UID is mapped to 0
 inside the container, so a process there believes it is root, while the host still
 sees it as owned by you.
 
-Still missing: image handling (`pull`, registry client) — you still have to supply
-the rootfs yourself. `pivot_root` is deferred; Phase 4 kept the plain `chroot`.
+Still missing: running an image *by name* and applying its config (env, workdir) —
+that is Phase 8. Today you `pull` an image and then point `run --rootfs` at the
+extracted directory. `pivot_root` is deferred; Phase 4 kept the plain `chroot`.
 
 **New to the code?** [docs/code-overview/code-overview.md](docs/code-overview/code-overview.md) is a detailed,
 educational walkthrough of how the runtime works: the two-stage re-exec
@@ -73,12 +76,16 @@ ccrun/
     Cli.cs             verb dispatch + usage
     ExitCodes.cs       named exit codes
     RunOptions.cs      argument parsing for `run` (--hostname, --rootfs, --memory, --cpus)
+    PullOptions.cs     argument parsing for `pull` (positional image reference)
     ResourceLimits.cs  parsed --memory/--cpus values in cgroup v2 units
     Commands/          RunCommand (parent stage) + ChildCommand (__child stage: sethostname, chroot, mount /proc, execvp)
+                       + PullCommand (orchestrates the image pull)
     Native/            libc P/Invoke (clone3, sethostname, chroot, chdir, mount, execve/execvp, pipe, waitpid, geteuid/getegid)
     Container/         ReExec (clone into namespaces, write the UID/GID maps, launch the child)
                        + Cgroup (create the container's cgroup, apply the limits, remove it)
                        + ProcessRunner (spawn command)
+    Registry/          Phase 7 image client: ImageReference, Manifests, Digest,
+                       RegistryClient (Docker Hub HTTP API V2), TarExtractor, ImageStore
   tests/CCRun.Tests/   xUnit test project
   alpine-rootfs/       downloaded Alpine root FS (git-ignored), used by --rootfs
 ```
@@ -145,6 +152,46 @@ ccrun now does that for itself, so the wrapper is no longer needed anywhere.
 Use **absolute** command paths with `--rootfs`: after `chroot`, a bare name is
 resolved against `PATH` *inside* the new root, so `/bin/busybox` is reliable where
 `busybox` may not be.
+
+## Pulling images
+
+`ccrun pull <image>` fetches an image from Docker Hub with no Docker CLI or
+daemon — just an anonymous, read-only client for the Registry HTTP API V2. It
+authenticates with an anonymous bearer token, follows a multi-arch image index to
+the manifest for your host architecture, downloads each layer verifying its
+SHA-256 digest as it streams to disk, and extracts the gzipped-tar layers in order
+into a local store, honoring overlay whiteouts. The image config is stored beside
+the rootfs.
+
+```sh
+dotnet build
+BIN=src/CCRun/bin/Debug/net10.0/CCRun
+
+$BIN pull ubuntu            # library/ubuntu:latest
+$BIN pull alpine:3.20       # a specific tag
+$BIN pull myorg/myapp       # a user/org repository
+```
+
+The store lives under `~/.ccrun/images/`:
+
+```
+~/.ccrun/images/<repository>/<tag>/
+  rootfs/        the extracted, ready-to-run root filesystem
+  config.json    the image config blob (used by Phase 8)
+```
+
+The produced `rootfs` is a plain directory, so you can run a pulled image today by
+pointing `run --rootfs` at it (running by *name* is Phase 8):
+
+```sh
+$BIN pull ubuntu
+$BIN run --rootfs ~/.ccrun/images/library/ubuntu/latest/rootfs /bin/bash -c 'cat /etc/os-release'
+```
+
+Image references normalize the way Docker's do: a bare `ubuntu` becomes
+`registry-1.docker.io/library/ubuntu:latest`; `:tag` and `@sha256:…` digests are
+parsed; `user/repo` skips the `library/` prefix. A layer whose bytes do not match
+its digest aborts the pull with an error — nothing half-verified is kept.
 
 ## Resource limits
 
@@ -243,5 +290,6 @@ above has moved on.
 - **Phase 4 — process isolation (PID + mount namespaces, private `/proc`)** ✅ done
 - **Phase 5 — rootless containers (user namespace + UID/GID mapping)** ✅ done
 - **Phase 6 — resource limits (cgroup v2 memory + CPU via `--memory`/`--cpus`)** ✅ done
-- Phases 7–8 (image pull, registry client) are forthcoming. `pivot_root` remains
-  deferred.
+- **Phase 7 — image pull from Docker Hub (`pull`, Registry API V2 client)** ✅ done
+- Phase 8 (run an image by name, apply its config env/workdir) is forthcoming.
+  `pivot_root` remains deferred.

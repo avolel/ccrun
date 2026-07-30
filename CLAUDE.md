@@ -5,8 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 CCRun is a "Build Your Own Docker" learning project: a lightweight Linux container
-runtime in C# / .NET 10, built in 8 phases. **The repo is currently at Phase 6
-(resource limits).** `ccrun run <command>` puts the command in a new user +
+runtime in C# / .NET 10, built in 8 phases. **The repo is currently at Phase 7
+(image pull).** `ccrun pull <image>` fetches an image from Docker Hub into a local
+store that `run --rootfs` consumes; the runtime itself is unchanged since Phase 6.
+`ccrun run <command>` puts the command in a new user +
 UTS namespace so it gets its own hostname and runs as root inside the container
 without the invoker being root outside, runs it, and passes back its exit code.
 
@@ -27,7 +29,19 @@ Orthogonally to `--rootfs`, **`--memory` and `--cpus` (Phase 6)** put the contai
 in a cgroup v2 directory of its own carrying those limits. Requesting neither skips
 the whole mechanism, so an unlimited run behaves exactly as it did in Phase 5.
 
-Still missing: image handling (`pull`, registry client). `pivot_root` is deferred —
+**Phase 7 adds `ccrun pull <image>`** — an anonymous Docker Hub client (Registry
+HTTP API V2). It gets an anonymous bearer token, fetches the manifest — following
+a multi-arch **OCI image index / Docker manifest list** to the `linux/<host-arch>`
+child, skipping `architecture: "unknown"` attestation entries — downloads each
+layer with its SHA-256 digest verified *while streaming to disk* (never buffering
+a whole blob), extracts the gzipped-tar layers **in manifest order** into
+`~/.ccrun/images/<repo>/<tag>/rootfs`, and stores the image config alongside as
+`config.json`. It touches none of the namespace / clone3 / cgroup runtime; the
+produced rootfs is a plain directory, so `run --rootfs ~/.ccrun/images/…/rootfs`
+runs a pulled image today. Running an image *by name* and applying its config
+(env/workdir) is Phase 8, out of scope here.
+
+Still missing: run-by-name + config application (Phase 8). `pivot_root` is deferred —
 Phase 4 kept the plain `chroot`, since the FR-4.x/5.x requirements do not need the
 stronger boundary.
 
@@ -111,7 +125,16 @@ test; do not replace it with a fixed `/sys/fs/cgroup/ccrun/` path, which would
 require root and regress Phase 5. `--memory` also writes `memory.swap.max=0`, or the
 cgroup swaps instead of OOM-killing and the cap never visibly bites.
 
-Remaining phases add: image pull + registry client (7–8).
+A non-obvious landmine in the Phase 7 code lives in `TarExtractor`: a purely
+lexical `Path.GetFullPath`-then-prefix check (as `RunCommand.cs` uses on the one
+`--rootfs` path a human typed) is **not** sufficient for tar extraction. A layer
+can plant a symlink `foo -> /` and then write `foo/passwd`; the second entry is
+lexically inside the rootfs, but the write follows the symlink out. So the
+extractor also refuses to write through any existing symlinked parent directory
+(`EscapesViaSymlink`), and deletes a symlink-to-dir as a *link* rather than
+recursing into its target. Do not drop that guard for the lexical check alone.
+
+Remaining phases add: run image by name + apply config env/workdir (Phase 8).
 
 ## Commands
 
@@ -144,6 +167,9 @@ $BIN run /bin/sleep 500 & ps -o pid,user,cmd -C sleep; kill %1
 # resource limits: the container's cgroup path, then the cap biting (exit 137)
 $BIN run --memory 128m --cpus 0.5 /bin/sh -c 'cat /proc/self/cgroup'
 $BIN run --memory 16m /bin/sh -c 'x=""; while :; do x="$x$(head -c 1000000 /dev/zero | tr "\0" a)"; done'
+# Phase 7: pull an image from Docker Hub, then run the produced rootfs.
+$BIN pull ubuntu                                       # token → index → layers → extract
+$BIN run --rootfs ~/.ccrun/images/library/ubuntu/latest/rootfs /bin/bash -c 'cat /etc/os-release'
 ```
 
 Note `--rootfs` paths resolve against the **current directory**, so run from the
@@ -189,6 +215,23 @@ unprivileged.
   `ProcessRunner` spawns the user command on the no-`--rootfs` path and returns its
   exit code. Command logic takes injectable `TextWriter` stdout/stderr (no `Console`
   statics) so it is unit-testable.
+- `src/CCRun/Registry/` — **Phase 7, the image client**, self-contained and touching
+  none of the runtime. One responsibility per file: `ImageReference` (pure parsing of
+  `[registry/]repo[:tag][@digest]` with Docker Hub shorthands — bare `ubuntu` →
+  `library/ubuntu:latest` on `registry-1.docker.io`); `Manifests` (System.Text.Json
+  source-generated DTOs for the index/manifest/token, plus the pure
+  `SelectPlatformDigest` arch-selection seam and the host-arch/OS mapping);
+  `Digest` (SHA-256 `sha256:<hex>` verification, whole-buffer and streaming via
+  `IncrementalHash`); `RegistryClient` (the network seam over one `HttpClient` —
+  token, manifest-following-index, blob download that streams-while-hashing and
+  verifies at the end); `TarExtractor` (gzip→tar extraction with the traversal +
+  symlink-through guards and overlay whiteouts — see the landmine note above);
+  `ImageStore` (owns the `~/.ccrun/images/<repo>/<tag>/{rootfs,config.json}` layout,
+  resets a stale rootfs, drives extraction in manifest order). `PullOptions` +
+  `Commands/PullCommand` mirror the `run` command conventions (parse → orchestrate,
+  progress to stdout, failures → `ExitCodes.RuntimeError`). The assembly carries
+  `[assembly: SupportedOSPlatform("linux")]` so BCL Linux-only calls
+  (`File.SetUnixFileMode`) don't ripple CA1416 to every caller.
 - `tests/CCRun.Tests/` — xUnit tests, references `src/CCRun`. `CliTests` covers
   verb dispatch and usage; `RunOptionsTests` covers argument parsing;
   `ProcessRunnerTests` asserts the child-process exit-code contract;
@@ -214,6 +257,15 @@ unprivileged.
   child and wait status clear of the xunit host, and makes the container's real
   stdout assertable across the `execvp` hand-off, which would defeat an in-process
   `StringWriter`.
+  The **Phase 7 suite is fully offline/hermetic** (no `[SkippableFact]`, nothing
+  hits Docker Hub): `ImageReferenceTests` / `PullOptionsTests` (parsing),
+  `DigestTests` (known SHA-256 vectors + a tamper case), `ManifestParsingTests`
+  (fixture JSON for index/manifest incl. the skipped `unknown` attestation entry),
+  `RegistryClientTests` (a fake `HttpMessageHandler` drives token→index→child→blob
+  and asserts the `Accept` headers, arch selection, and digest rejection), and
+  `TarExtractorTests` (in-memory gzipped tars into a temp dir — the traversal,
+  planted-symlink and escaping-hardlink rejections and both whiteout forms). A real
+  end-to-end `pull` is a documented **manual** step, not a test.
 - `alpine-rootfs/` — Alpine minirootfs, **git-ignored**, the rootfs used by
   `--rootfs` for chroot testing. Recreate via the commands in README.md if
   missing; presence is verified by the `ALPINE_FS_ROOT` marker file and

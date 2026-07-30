@@ -23,6 +23,8 @@ public static class Cli
         {
             case "run":
                 return RunCommand.Execute(args.AsSpan(1).ToArray(), stdout, stderr);
+            case "pull":
+                return PullCommand.Execute(args.AsSpan(1).ToArray(), stdout, stderr);
             case ReExec.ChildVerb:
                 return ChildCommand.Execute(args.AsSpan(1).ToArray(), stdout, stderr);
             case "-h":
@@ -45,6 +47,7 @@ public static class Cli
         w.WriteLine("usage:");
         w.WriteLine("  ccrun run [--hostname <name>] [--rootfs <path>] [--memory <size>] [--cpus <n>] <command> [args...]");
         w.WriteLine("                                  run a command in a container");
+        w.WriteLine("  ccrun pull <image>              pull an image from Docker Hub into ~/.ccrun/images");
         w.WriteLine("  ccrun --help                    show this help");
         w.WriteLine();
         w.WriteLine("Phase 6: 'run' isolates the hostname (UTS ns) and runs rootless in a user namespace,");
